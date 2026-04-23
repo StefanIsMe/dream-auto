@@ -24,6 +24,7 @@ State: ~/.hermes/state/dream/<dream_id>/
 
 import json
 import os
+import psutil
 import random
 import re
 import sqlite3
@@ -38,6 +39,7 @@ from typing import Any, Optional
 
 # ── paths ────────────────────────────────────────────────────────────────────
 DREAM_DIR = Path.home() / ".hermes" / "state" / "dream"
+SYSTEM_PAUSE_FLAG = DREAM_DIR / "SYSTEM_PAUSE"
 DB_PATH = Path.home() / ".hermes" / "state" / "dream" / "session_index.db"
 SESSIONS_DIR = Path.home() / ".hermes" / "sessions"
 HERMES_BIN = Path.home() / ".local" / "bin" / "hermes"
@@ -541,6 +543,61 @@ def tree_summary(tree: dict) -> str:
     return "\n".join(lines[:30])  # limit output size
 
 
+# ── Self-throttling between iterations ────────────────────────────────────────
+
+def self_throttle(base_sleep: int = SLEEP_SECONDS) -> float:
+    """
+    Check system resources and pause flag before continuing next iteration.
+    Returns actual seconds slept. If SYSTEM_PAUSE exists, waits until removed.
+    If CPU/RAM are high, extends sleep or asks LLM for guidance.
+    """
+    # 1. Check for system pause flag
+    if SYSTEM_PAUSE_FLAG.exists():
+        print(f"  [THROTTLE] SYSTEM_PAUSE detected — waiting for removal...")
+        waited = 0
+        while SYSTEM_PAUSE_FLAG.exists():
+            time.sleep(30)
+            waited += 30
+            if waited % 120 == 0:
+                print(f"  [THROTTLE] Still paused after {waited}s...")
+        print(f"  [THROTTLE] Pause lifted after {waited}s, resuming")
+        return waited
+
+    # 2. Check resources
+    try:
+        cpu = psutil.cpu_percent(interval=1.0)
+        ram = psutil.virtual_memory().percent
+    except Exception:
+        cpu, ram = 0, 0
+
+    # 3. Hard cap: critical resources → long sleep
+    if cpu >= 90 or ram >= 95:
+        sleep_time = 120
+        print(f"  [THROTTLE] CPU={cpu:.0f}% RAM={ram:.0f}% critical — sleeping {sleep_time}s")
+        time.sleep(sleep_time)
+        return sleep_time
+
+    # 4. High but not critical → moderate sleep
+    if cpu >= 75 or ram >= 85:
+        sleep_time = 90
+        print(f"  [THROTTLE] CPU={cpu:.0f}% RAM={ram:.0f}% high — sleeping {sleep_time}s")
+        time.sleep(sleep_time)
+        return sleep_time
+
+    # 5. Moderate → base sleep
+    if cpu >= 50 or ram >= 70:
+        sleep_time = base_sleep
+        print(f"  [THROTTLE] CPU={cpu:.0f}% RAM={ram:.0f}% moderate — sleeping {sleep_time}s")
+        time.sleep(sleep_time)
+        return sleep_time
+
+    # 6. Low → short sleep (turbo)
+    sleep_time = max(10, base_sleep // 2)
+    print(f"  [THROTTLE] CPU={cpu:.0f}% RAM={ram:.0f}% low — sleeping {sleep_time}s")
+    time.sleep(sleep_time)
+    return sleep_time
+
+
 # ── Main MCTS loop ────────────────────────────────────────────────────────────
 
 def mcts_loop(dream_id: str, brief: str) -> dict:
@@ -684,7 +741,7 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
             break
 
         print(f"  Confidence so far: {best_confidence:.2f}")
-        time.sleep(SLEEP_SECONDS)
+        self_throttle()
 
     # ── Final distillation ────────────────────────────────────────────────────
     print("[DISTILLATION] Running uncertainty-aware distillation...")

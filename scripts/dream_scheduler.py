@@ -395,13 +395,70 @@ def run_scheduler_cycle(dry_run: bool = False) -> dict:
     return results
 
 
+def adaptive_sleep(base_minutes: int = 30) -> int:
+    """
+    Ask the LLM how long the daemon should sleep before next cycle.
+    Returns seconds to sleep. Range: 2 min (turbo) to 60 min (idle).
+    Shorter sleep when queue is backed up and resources are good.
+    Longer sleep when idle or resources are tight.
+    """
+    try:
+        from resource_monitor import ResourceMonitor
+        rm = ResourceMonitor()
+        state = rm.get_state()
+        cpu = state["cpu_percent"]
+        ram = state["ram_percent"]
+        running = count_running_dreams()
+
+        # Count queued dreams
+        conn = sqlite3.connect(str(DREAM_QUEUE_DB))
+        queued_count = conn.execute("SELECT COUNT(*) FROM dream_queue WHERE status = 'queued'").fetchone()[0]
+        conn.close()
+
+        prompt = (
+            f"You are a scheduler daemon. Current state:\n"
+            f"- CPU: {cpu:.0f}% | RAM: {ram:.0f}%\n"
+            f"- Dreams running: {running}\n"
+            f"- Dreams queued: {queued_count}\n"
+            f"Base interval is {base_minutes} minutes.\n"
+            f"How many minutes until the next check? Consider:\n"
+            f"- If queue is large and resources are free → check sooner\n"
+            f"- If queue is empty or resources are tight → check later\n"
+            f"Answer JSON only: {{\"sleep_minutes\": N, \"reason\": \"brief\"}}"
+        )
+        result = subprocess.run(
+            [HERMES_BIN, "chat", "-q", prompt],
+            capture_output=True, text=True, timeout=15,
+            cwd=str(Path.home()),
+        )
+        output = result.stdout
+        for match in __import__("re").finditer(
+            r'\{"sleep_minutes":\s*(\d+),\s*"reason":\s*"[^"]*"\}', output
+        ):
+            try:
+                data = json.loads(match.group())
+                minutes = int(data.get("sleep_minutes", base_minutes))
+                reason = data.get("reason", "LLM decision")
+                # Clamp: 2 min minimum (turbo), 60 min maximum (idle)
+                minutes = max(2, min(60, minutes))
+                print(f"  [LLM] Next check in {minutes} min — {reason}")
+                return minutes * 60
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"  [LLM] Adaptive sleep failed: {e} — using base {base_minutes} min")
+    return base_minutes * 60
+
+
 def run_daemon(interval_minutes: int = 30):
-    """Run scheduler as a daemon."""
-    print(f"[DAEMON] Dream scheduler running every {interval_minutes} minutes")
+    """Run scheduler as a daemon with adaptive sleep intervals."""
+    print(f"[DAEMON] Dream scheduler running (adaptive intervals, base={interval_minutes} min)")
     while True:
         results = run_scheduler_cycle()
         print(f"[DAEMON] Cycle done: {results}")
-        time.sleep(interval_minutes * 60)
+        sleep_seconds = adaptive_sleep(base_minutes=interval_minutes)
+        print(f"[DAEMON] Sleeping {sleep_seconds // 60} minutes...")
+        time.sleep(sleep_seconds)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
