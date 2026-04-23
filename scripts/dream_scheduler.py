@@ -192,20 +192,84 @@ Reason: {session_data.get('reason', 'not evaluated')[:200]}
     return brief
 
 
-# ── Resource check ───────────────────────────────────────────────────────────
+# ── Dynamic concurrency ───────────────────────────────────────────────────────
 
-def check_resources():
-    """Check if we have resources to start a dream."""
+def llm_decide_concurrency(state: dict) -> int:
+    """
+    Ask the LLM how many dreams can run concurrently given current resources.
+    One call per scheduler cycle (every 30 min). Returns recommended count.
+    """
+    prompt = (
+        f"You are a resource scheduler. Current system state:\n"
+        f"- CPU usage: {state['cpu_percent']:.0f}%\n"
+        f"- RAM usage: {state['ram_percent']:.0f}%\n"
+        f"- Active Hermes sessions: {state['active_sessions']}\n"
+        f"- Active cron jobs: {state['active_crons']}\n"
+        f"- Dreams currently running: {state['active_dreams']}\n"
+        f"Each dream spawns a subprocess that calls 'hermes chat -q' for LLM reasoning.\n"
+        f"How many ADDITIONAL dreams should start now?\n"
+        f"Answer JSON only: {{\"max_concurrent\": N, \"reason\": \"brief explanation\"}}"
+    )
+    try:
+        result = subprocess.run(
+            [HERMES_BIN, "chat", "-q", prompt],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(Path.home()),
+        )
+        output = result.stdout
+        # Find last JSON object with max_concurrent
+        for match in __import__("re").finditer(
+            r'\{"max_concurrent":\s*(\d+),\s*"reason":\s*"[^"]*"\}', output
+        ):
+            try:
+                data = json.loads(match.group())
+                count = int(data.get("max_concurrent", 1))
+                reason = data.get("reason", "LLM decision")
+                print(f"  [LLM] Recommends {count} additional dreams — {reason}")
+                return max(0, count)
+            except Exception:
+                continue
+    except subprocess.TimeoutExpired:
+        print("  [LLM] Concurrency decision timed out — falling back to 1")
+    except Exception as e:
+        print(f"  [LLM] Concurrency decision failed: {e} — falling back to 1")
+    return 1
+
+
+def check_resources_and_concurrency():
+    """
+    Check resources and decide how many dreams can start this cycle.
+    Returns (available: bool, reason: str, max_additional: int)
+    """
     try:
         from resource_monitor import ResourceMonitor
         rm = ResourceMonitor()
-        available, reason = rm.can_start_dream()
-        return available, reason
+        state = rm.get_state()
+        cpu = state["cpu_percent"]
+        ram = state["ram_percent"]
+
+        # Hard stop: clearly overloaded
+        if cpu >= 90 or ram >= 95:
+            return False, f"CPU={cpu:.0f}% or RAM={ram:.0f}% critical", 0
+
+        # Hard stop: too many already running (safety cap)
+        running = count_running_dreams()
+        if running >= 5:
+            return False, f"{running} dreams already running (safety cap)", 0
+
+        # Dynamic: ask LLM for concurrency decision
+        state["active_dreams"] = running
+        max_additional = llm_decide_concurrency(state)
+
+        if max_additional <= 0:
+            return False, f"LLM recommends 0 additional dreams", 0
+
+        return True, f"Resources OK, LLM allows {max_additional} more", max_additional
+
     except Exception as e:
         print(f"  [RESOURCE] Fallback check: {e}")
-        # Simple fallback: just check if any dreams are running
         running = count_running_dreams()
-        return running == 0, f"{running} dreams running"
+        return running == 0, f"{running} dreams running (fallback)", 1 if running == 0 else 0
 
 
 # ── Start a dream via delegate ───────────────────────────────────────────────
@@ -277,77 +341,57 @@ def run_scheduler_cycle(dry_run: bool = False) -> dict:
     ensure_queue_db()
     results = {"dreams_started": 0, "skipped": [], "errors": []}
 
-    # 1. Check resources
-    available, reason = check_resources()
+    # 1. Check resources + get dynamic concurrency limit
+    available, reason, max_additional = check_resources_and_concurrency()
     print(f"[SCHEDULER] Resource check: {'available' if available else 'NOT available'} — {reason}")
 
-    if not available:
+    if not available or max_additional <= 0:
         results["skipped"].append(f"resources: {reason}")
         return results
 
-    # 2. Check if we're already running max dreams
-    running = count_running_dreams()
-    if running >= 1:
-        print(f"[SCHEDULER] Already {running} dreams running — skipping")
-        results["skipped"].append(f"already {running} running")
-        return results
+    # 2. Pull top N dreams from queue (up to max_additional)
+    queued = get_top_queued(limit=max_additional)
+    started = 0
 
-    # 3. Check queue for pending dreams
-    queued = get_top_queued(limit=1)
-    if queued:
-        # Start queued dream
-        item = queued[0]
+    for item in queued:
         print(f"[SCHEDULER] Starting queued dream: {item['dream_id']}")
         if not dry_run:
             brief = item.get("question", "Explore this topic deeply")
             ok = start_dream_via_delegate(item["dream_id"], brief, item.get("session_id", ""))
             if ok:
-                results["dreams_started"] = 1
+                started += 1
             else:
                 results["errors"].append(f"spawn failed: {item['dream_id']}")
         else:
-            results["dreams_started"] = 1
-        return results
+            started += 1
 
-    # 4. If queue empty, pick best un-dreamed session and add to queue
-    print("[SCHEDULER] Queue empty — checking for new sessions...")
-    sessions = get_session_with_highest_potential(limit=3)
+    # 3. If queue had fewer than max_additional, fill remaining slots from new sessions
+    remaining = max_additional - started
+    if remaining > 0:
+        print(f"[SCHEDULER] Queue gave {started}, need {remaining} more — checking sessions...")
+        sessions = get_session_with_highest_potential(limit=remaining)
 
-    if not sessions:
-        print("[SCHEDULER] No sessions with dream potential found.")
-        results["skipped"].append("no sessions")
-        return results
+        for sess in sessions:
+            potential = sess.get("potential", 0)
+            if potential < 0.4:
+                print(f"[SCHEDULER] Potential {potential:.2f} < 0.4 — skipping remaining")
+                results["skipped"].append(f"low potential: {potential:.2f}")
+                break
 
-    best = sessions[0]
-    potential = best.get("potential", 0)
+            brief = build_dream_brief(sess)
+            print(f"[SCHEDULER] New dream: session={sess['session_id']} potential={potential:.2f}")
 
-    # Only start dreams for sessions with reasonable potential
-    if potential < 0.4:
-        print(f"[SCHEDULER] Best potential {potential:.2f} < 0.4 — skipping")
-        results["skipped"].append(f"low potential: {potential:.2f}")
-        return results
+            if not dry_run:
+                dream_id = add_to_queue(sess["session_id"], brief, potential)
+                ok = start_dream_via_delegate(dream_id, brief, sess["session_id"])
+                if ok:
+                    started += 1
+                else:
+                    results["errors"].append("spawn failed")
+            else:
+                started += 1
 
-    brief = build_dream_brief(best)
-    print(f"[SCHEDULER] New dream: session={best['session_id']} potential={potential:.2f}")
-    print(f"  Brief: {brief[:200]}...")
-
-    if not dry_run:
-        # Add to queue then start
-        dream_id = add_to_queue(best["session_id"], brief, potential)
-        ok = start_dream_via_delegate(dream_id, brief, best["session_id"])
-        if ok:
-            results["dreams_started"] = 1
-        else:
-            results["errors"].append("spawn failed")
-    else:
-        results["dreams_started"] = 0
-        results["dry_run"] = True
-        results["would_start"] = {
-            "session": best["session_id"],
-            "potential": potential,
-            "brief_preview": brief[:200],
-        }
-
+    results["dreams_started"] = started
     return results
 
 
