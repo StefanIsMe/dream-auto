@@ -85,7 +85,21 @@ hermes gateway start
 
 ## Installation
 
-### One-Liner (Recommended)
+### Easiest Way: Let Hermes Install It For You
+
+Copy this prompt and paste it into your Hermes chat. The agent reads the setup manifest and installs everything automatically.
+
+```
+Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the agent installation steps to install the Dream Auto plugin on this machine. Execute all steps sequentially and report back what was installed.
+```
+
+That's it. Hermes will clone the repo, copy files, create databases, register cron jobs, and verify the installation.
+
+---
+
+### Alternative: Manual Install
+
+If you prefer to install yourself:
 
 ```bash
 git clone https://github.com/StefanIsMe/dream-auto.git
@@ -93,20 +107,9 @@ cd dream-auto
 python3 install.py
 ```
 
-### What the Installer Does
+The installer checks prerequisites, installs dependencies, copies files to `~/.hermes/`, creates SQLite databases, registers cron jobs, and runs an initial session index.
 
-1. Checks Python 3.10+, Hermes CLI, and pip
-2. Installs Python dependencies (`psutil`, `rich`)
-3. Copies plugin + scripts + skills to `~/.hermes/`
-4. Creates SQLite databases (`session_index.db`, `dream_queue.db`)
-5. Registers two cron jobs:
-   - `dream-scheduler` — every 30 minutes
-   - `session-indexer` — every 6 hours
-6. Creates the `dream-dashboard` CLI wrapper
-7. Runs an initial session index
-8. Prints a verification report
-
-### Dry Run (Preview Without Installing)
+Preview mode (shows what it would do without making changes):
 
 ```bash
 python3 install.py --dry-run
