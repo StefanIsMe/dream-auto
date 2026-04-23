@@ -1,0 +1,11 @@
+name: dream_auto
+version: "1.0.0"
+description: Aggressive hermes-dream integration. Auto-injects dream thinking into context, auto-starts dreams for complex questions/errors/knowledge gaps, feeds session learnings back into dreams, wakes dreams on topic match. 6 hook points.
+author: Hermes
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - post_llm_call
+  - on_session_start
+  - on_session_end
