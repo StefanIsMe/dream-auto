@@ -88,31 +88,35 @@ hermes gateway start
 
 ## Installation
 
-### Easiest Way: Let Hermes Install It For You
+### Let Hermes Install It For You
 
 Copy this prompt and paste it into your Hermes chat:
 
 ```
-Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the agent installation steps to install the Dream Auto v3 background-thinking plugin on this machine. Execute all steps sequentially and report back what was installed.
+Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the setup steps to install Dream Auto v3 on this machine. Execute all steps. Report what was installed.
 ```
 
-That's it. Hermes will clone the repo, copy files, create databases, register cron jobs, and verify the installation.
+Hermes will clone the repo, copy files, create databases, register cron jobs, and verify.
 
----
-
-### Alternative: Manual Install
+### Manual / One-Shot Install
 
 ```bash
 git clone https://github.com/StefanIsMe/dream-auto.git
 cd dream-auto
-python3 install.py
+# Then follow the "All-in-One Install / Upgrade Command" block in SETUP.md
 ```
 
-Preview mode (shows what it would do without making changes):
+The SETUP.md contains both the one-line shell command (paste into terminal) and the full step-by-step breakdown for manual or troubleshooting.
+
+### Upgrading
 
 ```bash
-python3 install.py --dry-run
+cd ~/dream-auto
+git pull
+# Then re-run the copy commands from the upgrade section in SETUP.md
 ```
+
+The SETUP.md upgrade section has the exact steps. Databases are preserved — only the file copies and DB index additions run.
 
 ---
 
@@ -205,13 +209,12 @@ You don't interact with it. It just makes Hermes smarter over time.
 ```
 dream-auto/
 ├── README.md              # This file
-├── SETUP.md               # Detailed setup guide
-├── install.py             # Cross-platform installer
-├── requirements.txt       # Python dependencies
+├── SETUP.md              # Full install/upgrade guide
+├── requirements.txt      # Python dependencies
 ├── plugins/
-│   └── dream_auto/        # Plugin source
-├── scripts/               # Scheduler, dashboard, indexer, grader
-└── skills/                # MCTS engine v3 + documentation
+│   └── dream_auto/     # Plugin source
+├── scripts/              # Scheduler, dashboard, indexer, grader
+└── skills/               # MCTS engine v3 + documentation
 ```
 
 ---
