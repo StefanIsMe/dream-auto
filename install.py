@@ -197,10 +197,10 @@ def init_state() -> bool:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         (STATE_DIR / "logs").mkdir(exist_ok=True)
 
-        # session_index.db schema (session_indexer will create full schema, but ensure dir exists)
+        # session_index.db schema + indexes
         db_path = STATE_DIR / "session_index.db"
+        conn = sqlite3.connect(str(db_path))
         if not db_path.exists():
-            conn = sqlite3.connect(str(db_path))
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
@@ -227,15 +227,22 @@ def init_state() -> bool:
                     errors INTEGER
                 )
             """)
-            conn.commit()
-            conn.close()
             _print("OK", f"Created session_index.db")
+        # Always create indexes (idempotent — CREATE INDEX IF NOT EXISTS is safe on existing tables)
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_sessions_dream_potential ON sessions(dream_potential DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_had_errors     ON sessions(had_errors)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_last_dreamed  ON sessions(last_dreamed_at)",
+        ]:
+            conn.execute(idx_sql)
+        conn.commit()
+        conn.close()
 
-        # dream_queue.db schema
+        # dream_queue.db schema + indexes
         queue_db = STATE_DIR / "dream_queue.db"
+        conn2 = sqlite3.connect(str(queue_db))
         if not queue_db.exists():
-            conn = sqlite3.connect(str(queue_db))
-            conn.execute("""
+            conn2.execute("""
                 CREATE TABLE IF NOT EXISTS dream_queue (
                     queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT,
@@ -250,9 +257,38 @@ def init_state() -> bool:
                     status TEXT DEFAULT 'queued'
                 )
             """)
-            conn.commit()
-            conn.close()
             _print("OK", f"Created dream_queue.db")
+        # Always create indexes
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_queue_status_priority ON dream_queue(status, priority DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_queue_dream_id       ON dream_queue(dream_id)",
+        ]:
+            conn2.execute(idx_sql)
+        conn2.commit()
+        conn2.close()
+
+        # knowledge_cache.db (v3 new — always create if missing, always add indexes)
+        cache_db = STATE_DIR / "knowledge_cache.db"
+        conn3 = sqlite3.connect(str(cache_db))
+        if not cache_db.exists():
+            conn3.execute("""
+                CREATE TABLE IF NOT EXISTS knowledge_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic TEXT,
+                    content TEXT,
+                    source TEXT,
+                    cached_at TEXT,
+                    content_hash TEXT UNIQUE
+                )
+            """)
+            _print("OK", f"Created knowledge_cache.db")
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_topic_cached ON knowledge_cache(topic, cached_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_cached       ON knowledge_cache(cached_at DESC)",
+        ]:
+            conn3.execute(idx_sql)
+        conn3.commit()
+        conn3.close()
 
         return True
     except Exception as e:

@@ -345,6 +345,38 @@ Tell the user:
 
 ---
 
+## Upgrading from v1 / v2
+
+If you already have Dream Auto installed, you can upgrade to v3 without losing your session index or queue.
+
+**Option A: Pull latest and re-run installer with --force**
+
+```bash
+cd ~/dream-auto
+git pull
+python3 install.py --force
+```
+
+`--force` overwrites all plugin, script, and skill files with the latest versions. Your SQLite databases (`session_index.db`, `dream_queue.db`) are preserved — `CREATE TABLE IF NOT EXISTS` does not touch existing data.
+
+**Option B: Agent-guided upgrade**
+
+Paste this into your Hermes chat:
+
+```
+Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the upgrade steps to update Dream Auto to v3 on this machine.
+```
+
+**After upgrading, run a fresh session index to apply v3 grading:**
+
+```bash
+python3 ~/.hermes/scripts/session_indexer.py --limit 50
+```
+
+v3 uses different SQLite indexes for queue drainage and session sorting. Existing sessions will be re-graded on next indexer run. The dream queue is preserved — pending dreams from v1/v2 will still drain normally.
+
+---
+
 ## One-Line Install Prompt (Copy-Paste for Users)
 
 Give this exact prompt to any Hermes Agent user. They paste it into their chat:
@@ -353,6 +385,8 @@ Give this exact prompt to any Hermes Agent user. They paste it into their chat:
 Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the agent installation steps to install the Dream Auto v3 background-thinking plugin on this machine. Execute all steps sequentially and report back what was installed.
 ```
 
+**Existing users:** The same prompt works for upgrades. The installer detects existing files and prompts to overwrite.
+
 ---
 
 ## Files in This Distribution
@@ -360,25 +394,24 @@ Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the
 ```
 dream-auto/
 ├── install.py              # Alternative: run this instead of manual steps
-├── SETUP.md                # This file — agent-executable instructions
+├── SETUP.md               # This file — agent-executable instructions
 ├── README.md               # Human-readable overview
 ├── requirements.txt        # psutil, rich
 ├── plugins/
 │   └── dream_auto/        # Plugin source (__init__.py, resource_monitor.py, plugin.yaml)
 ├── scripts/
-│   ├── dream_scheduler.py       # Adaptive queue manager + wallclock killer
-│   ├── dream_insights_dashboard.py  # Rich CLI dashboard
-│   ├── session_indexer.py       # Session scanner + grader
-│   └── session_grader.py       # LLM-based potential scorer
+│   ├── dream_scheduler.py         # Adaptive queue manager + wallclock killer
+│   ├── dream_insights_dashboard.py # Rich CLI dashboard
+│   ├── session_indexer.py          # Session scanner + grader
+│   └── session_grader.py           # LLM-based potential scorer
 └── skills/
     ├── autonomous-ai-agents/hermes-dream-task/
     │   ├── scripts/dream_loop_v3.py  # MCTS engine v3 (parallelized, UCB1-Tuned)
-    │   ├── scripts/fast_path.py      # Heuristic分流 for simple queries
-    │   └── SKILL.md                 # Task skill reference
+    │   ├── scripts/fast_path.py       # Heuristic fast-path for simple queries
+    │   └── SKILL.md                  # Task skill reference
     └── ops/dream-system-v3/
-        └── SKILL.md                 # Full implementation reference
+        └── SKILL.md                  # Full implementation reference
 ```
-
 ---
 
 ## Troubleshooting (Agent Reference)
