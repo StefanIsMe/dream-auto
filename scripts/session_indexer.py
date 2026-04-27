@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS indexed_runs (
     session_count    INTEGER,
     errors           INTEGER
 );
+
+CREATE INDEX IF NOT EXISTS idx_sessions_dream_potential ON sessions(dream_potential DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_had_errors ON sessions(had_errors);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_dreamed ON sessions(last_dreamed_at);
 """
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -222,12 +226,48 @@ def upsert_session(data: dict):
     conn.close()
 
 
+def write_top_topics(filepath: Path, limit: int = 5):
+    """Write top N topics from session_index to a JSON file for the knowledge cache warmer."""
+    if not filepath.parent.exists():
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        rows = conn.execute("""
+            SELECT topics FROM sessions
+            WHERE topics IS NOT NULL AND topics != '[]'
+            ORDER BY
+                CASE WHEN dream_potential IS NOT NULL THEN dream_potential ELSE 0 END DESC,
+                message_count DESC
+            LIMIT ?
+        """, (limit * 2,)).fetchall()
+        conn.close()
+
+        topic_counts: dict[str, int] = {}
+        for (topics_json,) in rows:
+            try:
+                topics = json.loads(topics_json)
+                for t in topics:
+                    topic_counts[t] = topic_counts.get(t, 0) + 1
+            except Exception:
+                continue
+
+        sorted_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)
+        top = [t for t, _ in sorted_topics[:limit]]
+
+        filepath.write_text(json.dumps({"topics": top, "written_at": datetime.now(GMT7).isoformat()}, indent=2))
+        print(f"[TOPICS] Wrote: {top}")
+    except Exception as e:
+        print(f"[TOPICS] Error: {e}")
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Session Indexer for Dream System v3")
     parser.add_argument("--all", action="store_true", help="Index ALL sessions (default: last 100)")
     parser.add_argument("--limit", type=int, default=100, help="Max sessions to index (default 100)")
     parser.add_argument("--rescan", action="store_true", help="Re-index already-indexed sessions")
+    parser.add_argument("--write-topics", action="store_true", help="Write top topics to topics_for_cache.json")
+    parser.add_argument("--top-topics", type=int, default=5, help="Number of top topics to write (default 5)")
     args = parser.parse_args()
 
     ensure_db()
@@ -277,6 +317,10 @@ def main():
     total = len(to_index) - errors
     print(f"\nDone: {total} sessions indexed, {errors} errors")
     print(f"DB: {DB_PATH}")
+
+    if args.write_topics:
+        TOPICS_FILE = DREAM_DIR / "topics_for_cache.json"
+        write_top_topics(TOPICS_FILE, limit=args.top_topics)
 
 
 if __name__ == "__main__":

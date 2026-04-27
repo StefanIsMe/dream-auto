@@ -29,12 +29,15 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
 
 | Feature | What It Means For You |
 |---|---|
-| **MCTS Dream Engine (v3)** | Uses Monte Carlo Tree Search to explore multiple reasoning branches, not just one. More thorough, less shallow. |
-| **Zero Hardcoded Thresholds** | No magic numbers. Resource availability is the only gate. The LLM decides everything else. |
-| **Error → Dream Pipeline** | Tool crashes automatically trigger troubleshooting dreams. Fixed once, remembered forever. |
-| **Resource-Aware Scheduling** | Dreams only run when your machine is free. Never slows down active work. |
-| **Rich CLI Dashboard** | `dream-dashboard` shows live stats, recent insights, queue status, and session grades. |
-| **Cross-Platform** | Works on Linux, macOS, and Windows WSL. Auto-detects your Hermes installation. |
+| **MCTS Dream Engine v3** | Parallelized rollouts + MetaRAG calls. ~5.5x faster per iteration. |
+| **UCB1-Tuned Selection** | Variance-aware exploration that prevents chasing high-variance branches. |
+| **CI-Width Bonus** | Uncertain nodes get extra exploration nudge, scaled by tree depth. |
+| **Staleness Detection** | Dreams spinning without tree growth for 20+ minutes are cut off. |
+| **Wallclock Killer** | Scheduler kills any dream exceeding 30 minutes globally. |
+| **SQLite Performance Indexes** | Queue drains and session sorts are O(log n), not O(n). |
+| **Zero Hardcoded Thresholds** | Resource availability is the only gate. The LLM decides everything else. |
+| **Error → Dream Pipeline** | Tool crashes automatically trigger troubleshooting dreams. |
+| **Rich CLI Dashboard** | `dream-dashboard` shows live stats, insights, queue status, and grades. |
 
 ---
 
@@ -42,15 +45,15 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ Session Indexer │────▶│ Session Grader  │────▶│  Dream Queue    │
-│  (every 6h)     │     │  (LLM scores)   │     │  (SQLite)       │
+│ Session Indexer │────▶│ Session Grader  │────▶│  Dream Queue   │
+│   (every 6h)    │     │  (LLM scores)   │     │   (SQLite)     │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
                                                        │
                                                        ▼
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │  Insight        │◀────│  MCTS Dream     │◀────│  Scheduler      │
-│  Injection      │     │  Engine (v3)    │     │  (every 30min)  │
-│  (pre_llm_call) │     │                 │     │                 │
+│  Injection      │     │  Engine v3      │     │  (every 30min)  │
+│ (pre_llm_call)  │     │  (parallel)     │     │                 │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
         ▲                                               │
         └───────────────────────────────────────────────┘
@@ -59,8 +62,8 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
 
 - **Session Indexer** scans `~/.hermes/sessions/` for transcripts, extracts topics, errors, and open questions
 - **Session Grader** asks an LLM: "How much would dreaming about this session help future conversations?"
-- **Scheduler** checks resources and picks the highest-priority queued dream
-- **MCTS Engine** runs Monte Carlo Tree Search with UCB1 selection, branch expansion, rollouts, and Wilson confidence intervals
+- **Scheduler** checks resources and picks the highest-priority queued dream (with wallclock killer)
+- **MCTS Engine v3** runs Monte Carlo Tree Search with UCB1-Tuned selection, parallel rollouts, parallel MetaRAG calls, and Wilson confidence intervals
 - **Insight Injection** silently prepends the best findings from completed dreams into your active context
 
 ---
@@ -69,7 +72,7 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
 
 | Requirement | Check | Notes |
 |---|---|---|
-| Python 3.10+ | `python3 --version` | Required for modern syntax |
+| Python 3.10+ | `python3 --version` | Required |
 | Hermes Agent CLI | `hermes --version` | Must be installed and in PATH |
 | pip | `pip3 --version` | For `psutil` and `rich` |
 | Linux / macOS / WSL | `uname -a` | Native Windows not supported |
@@ -87,10 +90,10 @@ hermes gateway start
 
 ### Easiest Way: Let Hermes Install It For You
 
-Copy this prompt and paste it into your Hermes chat. The agent reads the setup manifest and installs everything automatically.
+Copy this prompt and paste it into your Hermes chat:
 
 ```
-Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the agent installation steps to install the Dream Auto plugin on this machine. Execute all steps sequentially and report back what was installed.
+Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the agent installation steps to install the Dream Auto v3 background-thinking plugin on this machine. Execute all steps sequentially and report back what was installed.
 ```
 
 That's it. Hermes will clone the repo, copy files, create databases, register cron jobs, and verify the installation.
@@ -99,15 +102,11 @@ That's it. Hermes will clone the repo, copy files, create databases, register cr
 
 ### Alternative: Manual Install
 
-If you prefer to install yourself:
-
 ```bash
 git clone https://github.com/StefanIsMe/dream-auto.git
 cd dream-auto
 python3 install.py
 ```
-
-The installer checks prerequisites, installs dependencies, copies files to `~/.hermes/`, creates SQLite databases, registers cron jobs, and runs an initial session index.
 
 Preview mode (shows what it would do without making changes):
 
@@ -123,9 +122,10 @@ python3 install.py --dry-run
 
 ```bash
 dream-dashboard              # full overview
-dream-dashboard --insights   # recent insights only
-dream-dashboard --queue      # dream queue only
-dream-dashboard --errors     # error breakdown
+dream-dashboard --insights  # recent insights only
+dream-dashboard --queue     # dream queue only
+dream-dashboard --errors    # error breakdown
+dream-dashboard --dry-run   # test without running
 ```
 
 ### Manual Scheduler Check
@@ -140,13 +140,6 @@ python3 ~/.hermes/scripts/dream_scheduler.py --dry-run
 python3 ~/.hermes/scripts/session_indexer.py --limit 50
 ```
 
-### Verify Plugin Is Active
-
-```bash
-ls ~/.hermes/plugins/dream_auto/
-# Should show: __init__.py  plugin.yaml  resource_monitor.py
-```
-
 ---
 
 ## Configuration
@@ -158,6 +151,7 @@ Control the plugin with environment variables:
 | `DREAM_AUTO_ENABLED` | `1` | Set to `0` to disable entirely |
 | `DREAM_AUTO_VERBOSE` | `0` | Set to `1` for detailed logging |
 | `DREAM_AUTO_MAX_INJECT` | `3` | Max dream insights injected per turn |
+| `DREAM_AUTO_THROTTLE_TURNS` | `5` | Fire hook at most every N turns |
 
 Add to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.):
 
@@ -170,11 +164,11 @@ export DREAM_AUTO_VERBOSE=1
 
 ## How It Works Day-to-Day
 
-1. **You chat with Hermes normally.** The plugin listens via 6 hooks (`pre_llm_call`, `pre_tool_call`, `post_tool_call`, `post_llm_call`, `on_session_start`, `on_session_end`).
+1. **You chat with Hermes normally.** The plugin listens via hooks.
 2. **Errors or complex questions** are detected and queued automatically.
 3. **Session indexer** (every 6h) scans recent sessions and grades them for dream potential.
 4. **Scheduler** (every 30min) checks CPU/RAM. If resources are free, it starts the highest-priority dream.
-5. **MCTS engine** runs background reasoning, exploring multiple branches and distilling insights.
+5. **MCTS engine v3** runs background reasoning with parallel rollouts and MetaRAG calls.
 6. **On your next message**, the plugin injects the best insights from completed dreams into your context silently.
 
 You don't interact with it. It just makes Hermes smarter over time.
@@ -186,7 +180,7 @@ You don't interact with it. It just makes Hermes smarter over time.
 | Platform | Status | Notes |
 |---|---|---|
 | **Linux** | ✅ Full | Tested on Fedora. Uses `hermes cron` → systemd user service. |
-| **macOS** | ✅ Full | Uses `hermes cron` → launchd. Auto-detects Hermes path. |
+| **macOS** | ✅ Full | Uses `hermes cron` → launchd. |
 | **Windows WSL** | ✅ Full | Run inside WSL. Install Hermes inside WSL, not Windows native. |
 | **Windows Native** | ❌ No | POSIX paths and subprocess behavior not supported. |
 
@@ -202,6 +196,7 @@ You don't interact with it. It just makes Hermes smarter over time.
 | Dashboard shows empty | Run `session_indexer.py` manually once to populate DB |
 | Dreams never start | Check resources: `python3 ~/.hermes/plugins/dream_auto/resource_monitor.py` |
 | Plugin not loading | Verify `DREAM_AUTO_ENABLED=1` and restart Hermes |
+| Session index empty after install | Run `python3 ~/.hermes/scripts/session_indexer.py --limit 50` manually |
 
 ---
 
@@ -210,13 +205,13 @@ You don't interact with it. It just makes Hermes smarter over time.
 ```
 dream-auto/
 ├── README.md              # This file
-├── SETUP.md              # Detailed setup guide
-├── install.py            # Cross-platform installer
-├── requirements.txt      # Python dependencies
+├── SETUP.md               # Detailed setup guide
+├── install.py             # Cross-platform installer
+├── requirements.txt       # Python dependencies
 ├── plugins/
-│   └── dream_auto/       # Plugin source
-├── scripts/              # Scheduler, dashboard, indexer, grader
-└── skills/               # MCTS engine + documentation
+│   └── dream_auto/        # Plugin source
+├── scripts/               # Scheduler, dashboard, indexer, grader
+└── skills/                # MCTS engine v3 + documentation
 ```
 
 ---
@@ -225,7 +220,7 @@ dream-auto/
 
 - Built for [Hermes Agent](https://hermes-agent.nousresearch.com/) by [Stefan Carter](https://github.com/StefanIsMe)
 - MCTS engine design inspired by SwiftSage and Monte Carlo Tree Search literature
-- Version 3 philosophy: *resource availability is the only gate — no hardcoded thresholds*
+- Version 3: *resource availability is the only gate — no magic numbers, no hardcoded thresholds*
 
 ---
 

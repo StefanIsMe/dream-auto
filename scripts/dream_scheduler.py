@@ -48,7 +48,79 @@ CREATE TABLE IF NOT EXISTS dream_queue (
     completed_at   TEXT,
     status         TEXT DEFAULT 'queued'
 );
+
+CREATE INDEX IF NOT EXISTS idx_queue_status_priority ON dream_queue(status, priority DESC);
+CREATE INDEX IF NOT EXISTS idx_queue_dream_id ON dream_queue(dream_id);
 """
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+MAX_DREAM_WALLCLOCK_MINUTES = 30   # hard cap — any dream running longer is killed
+DREAM_WALLCLOCK_SECONDS = MAX_DREAM_WALLCLOCK_MINUTES * 60
+
+
+# ── Stale dream killer ─────────────────────────────────────────────────────────
+
+def kill_stale_dreams() -> list[dict]:
+    """
+    Ralph-loop wallclock enforcer: kill any dream running longer than MAX_DREAM_WALLCLOCK_MINUTES.
+    Called at the start of each scheduler cycle. Returns list of killed dream info.
+    """
+    if not DREAM_DIR.exists():
+        return []
+
+    killed = []
+    now = time.time()
+
+    for d in DREAM_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        meta_file = d / "meta.json"
+        status_file = d / "status.txt"
+
+        if not meta_file.exists():
+            continue
+
+        try:
+            meta = json.loads(meta_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        # Only kill if status is running
+        status = meta.get("status", "")
+        if status != "running":
+            continue
+
+        started_at = meta.get("started_at")
+        if started_at is None:
+            continue
+
+        elapsed = now - started_at
+        if elapsed > DREAM_WALLCLOCK_SECONDS:
+            dream_id = meta.get("dream_id", d.name)
+            wallclock_min = elapsed / 60
+            print(f"  [WALLCLOCK KILL] {dream_id} ran for {wallclock_min:.0f}min > {MAX_DREAM_WALLCLOCK_MINUTES}min — killing")
+
+            # Mark as killed in status
+            (status_file).write_text("killed_wallclock")
+            meta["status"] = "killed_wallclock"
+            meta["killed_at"] = now
+            meta["wallclock_minutes"] = round(wallclock_min, 1)
+            try:
+                write_json(meta_file, meta)
+            except Exception:
+                pass
+
+            # Also mark queue entry complete so it doesn't retry
+            mark_completed(dream_id, killed=True)
+
+            killed.append({
+                "dream_id": dream_id,
+                "wallclock_min": round(wallclock_min, 1),
+                "reason": f"exceeded {MAX_DREAM_WALLCLOCK_MINUTES}min wallclock"
+            })
+
+    return killed
+
 
 # ── Queue management ───────────────────────────────────────────────────────────
 
@@ -86,11 +158,12 @@ def mark_started(dream_id: str):
     conn.close()
 
 
-def mark_completed(dream_id: str):
+def mark_completed(dream_id: str, killed: bool = False):
+    status = "killed_wallclock" if killed else "completed"
     conn = sqlite3.connect(str(DREAM_QUEUE_DB))
     conn.execute("""
-        UPDATE dream_queue SET status='completed', completed_at=? WHERE dream_id=?
-    """, (datetime.now(GMT7).isoformat(), dream_id))
+        UPDATE dream_queue SET status=?, completed_at=? WHERE dream_id=?
+    """, (status, datetime.now(GMT7).isoformat(), dream_id))
     conn.commit()
     conn.close()
 
@@ -311,14 +384,17 @@ def start_dream_via_delegate(dream_id: str, brief: str, session_id: str):
     env["DREAM_LOOP_ACTIVE"] = "1"
 
     try:
+        # Line-buffered stdout + unbuffered python so dream_output.log shows live progress
+        log_fp = open(dp / "dream_output.log", "w", buffering=1)
+        env["PYTHONUNBUFFERED"] = "1"
         subprocess.Popen(
             [
-                sys.executable, str(DREAM_LOOP_V3),
+                sys.executable, "-u", str(DREAM_LOOP_V3),
                 dream_id, brief[:800]
             ],
             env=env,
             cwd=str(Path.home()),
-            stdout=open(dp / "dream_output.log", "w"),
+            stdout=log_fp,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -339,7 +415,13 @@ def write_json(path: Path, data):
 def run_scheduler_cycle(dry_run: bool = False) -> dict:
     """Run one scheduler cycle. Returns summary."""
     ensure_queue_db()
-    results = {"dreams_started": 0, "skipped": [], "errors": []}
+    results = {"dreams_started": 0, "skipped": [], "errors": [], "wallclock_killed": []}
+
+    # 0. Ralph-loop wallclock enforcer: kill dreams that have been running too long
+    killed = kill_stale_dreams()
+    if killed:
+        results["wallclock_killed"] = killed
+        print(f"[SCHEDULER] Killed {len(killed)} stale dreams")
 
     # 1. Check resources + get dynamic concurrency limit
     available, reason, max_additional = check_resources_and_concurrency()

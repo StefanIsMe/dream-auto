@@ -22,6 +22,7 @@ State: ~/.hermes/state/dream/<dream_id>/
     uncertainty.json        — confidence intervals
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPLETED
 import json
 import os
 import psutil
@@ -198,6 +199,56 @@ Keep labels to 10 words max. Total response under 500 words.
     return [{"approach_id": "fallback", "label": "Direct analysis", "description": brief}]
 
 
+# ── Anti-thrashing (Ralph-loop style) ─────────────────────────────────────────
+
+_iteration_history: list = []  # Module-level for persistence across iterations
+
+def detect_staleness(tree: dict, max_minutes: int = 20, no_progress_minutes: int = 8) -> dict:
+    """
+    Time-based staleness detection: a dream is stale if wallclock exceeded max_minutes
+    AND no new nodes were added in the last no_progress_minutes.
+    Returns dict with 'stale' bool and 'reason' string.
+    """
+    if not tree.get("wallclock_start"):
+        return {"stale": False}
+
+    try:
+        start = datetime.fromisoformat(tree["wallclock_start"])
+        last_added = datetime.fromisoformat(tree["last_node_added_at"])
+    except (ValueError, TypeError):
+        return {"stale": False}
+
+    now = datetime.now(GMT7)
+    total_minutes = (now - start).total_seconds() / 60
+    stale_minutes = (now - last_added).total_seconds() / 60
+
+    if total_minutes > max_minutes and stale_minutes > no_progress_minutes:
+        return {
+            "stale": True,
+            "reason": f"wallclock={total_minutes:.0f}min > {max_minutes}min AND "
+                      f"no new nodes for {stale_minutes:.0f}min > {no_progress_minutes}min"
+        }
+    return {"stale": False}
+
+
+def detect_thrashing(tree: dict, history: list, recent_confidences: list) -> bool:
+    """
+    Ralph-loop style: detect if we're spinning without making progress.
+    Same low-confidence result 3x in a row = thrashing → pivot to wrap_up.
+    """
+    if len(recent_confidences) < 3:
+        return False
+    # All last 3 iterations had same low confidence?
+    last3 = recent_confidences[-3:]
+    if len(set(round(c, 2) for c in last3)) == 1 and last3[0] < 0.55:
+        return True
+    # Confidence going down 2x in a row
+    if len(recent_confidences) >= 3:
+        if recent_confidences[-1] < recent_confidences[-2] < recent_confidences[-3]:
+            return True
+    return False
+
+
 # ── Rollout engine (ROLLOUT) ──────────────────────────────────────────────────
 
 def rollout(branch: dict, brief: str, iteration: int) -> dict:
@@ -253,13 +304,16 @@ def mcts_init_tree(brief: str) -> dict:
             }
         ],
         "current_root": root_id,
+        "last_node_added_at": datetime.now(GMT7).isoformat(),
+        "wallclock_start": datetime.now(GMT7).isoformat(),
     }
     return tree
 
 
 def mcts_select(tree: dict) -> Optional[str]:
     """SELECT: traverse tree, pick highest-value unexplored child.
-    Uses UCB1 (Upper Confidence Bound) to balance exploration/exploitation.
+    Uses UCB1-Tuned (variance-aware) with CI-width bonus for uncertain nodes.
+    Adaptive C: higher at low visits (exploration), lower at high visits (exploitation).
     """
     nodes_by_id = {n["node_id"]: n for n in tree["nodes"]}
     root = nodes_by_id.get(tree["current_root"], nodes_by_id["root"])
@@ -268,19 +322,40 @@ def mcts_select(tree: dict) -> Optional[str]:
     if not children:
         return None  # Leaf — expand here
 
-    # UCB1: balance exploration (C) and exploitation (win rate)
-    C = 1.4  # exploration constant
+    # Adaptive C: shrinks as tree gets more visited (more exploitation, less exploration)
+    # C = C_base * (1 + 1/sqrt(max(parent_visits,1)))
+    C_BASE = 1.414  # sqrt(2)
+    parent_visits = max(root.get("n_visits", 1), 1)
+    C_ADAPTIVE = C_BASE * (1.0 + 1.0 / _math.sqrt(parent_visits))
+
     best_child = None
     best_ucb = -float("inf")
 
     for child in children:
+        depth = child.get("depth", 1)
+        ci_width = child.get("ci_width", 1.0)
+
         if child["n_visits"] == 0:
             ucb = float("inf")  # unexplored = always try
         else:
             win_rate = child["wins"] / child["n_visits"]
-            ucb = win_rate + C * _math.sqrt(
-                _math.log(child["n_visits"]) / child["n_visits"]
-            )
+            n = child["n_visits"]
+
+            # UCB1-Tuned: use min() to cap exploration term by variance
+            # var = win_rate - win_rate^2 (Bernoulli variance estimate)
+            var = win_rate - win_rate * win_rate
+            ucb1_term = 2.0 * _math.log(parent_visits) / n
+            tuned_cap = 1.0 / n  # ~equivalent to upper confidence bound on variance
+            tuned_exploration = min(ucb1_term, tuned_cap + var)
+
+            # CI-width bonus: uncertain nodes (wide CI) get additional exploration nudge
+            # Scaled by depth so deep branches don't get wild bonuses
+            # Alpha=0.15 gives ~0.15 * ci_width * depth_factor nudge on top of UCB1
+            depth_factor = 1.0 / _math.sqrt(depth)
+            ci_bonus = 0.15 * ci_width * depth_factor * C_ADAPTIVE
+
+            ucb = win_rate + C_ADAPTIVE * _math.sqrt(tuned_exploration) + ci_bonus
+
         if ucb > best_ucb:
             best_ucb = ucb
             best_child = child
@@ -329,6 +404,10 @@ def mcts_expand(tree: dict, node_id: str, brief: str, depth: int) -> list[str]:
         parent["children"].append(child_id)
         new_ids.append(child_id)
 
+    # Track last expansion time for staleness detection
+    if new_ids:
+        tree["last_node_added_at"] = datetime.now(GMT7).isoformat()
+
     return new_ids
 
 
@@ -344,7 +423,7 @@ def mcts_backpropagate(tree: dict, node_id: str, outcome: float):
         node["wins"] = node.get("wins", 0.0) + outcome
         # Recalculate confidence
         n = node["n_visits"]
-        if n > 0:
+        if n > 1:
             mean = node["wins"] / n
             node["confidence"] = round(mean, 3)
             if n > 1:
@@ -470,12 +549,12 @@ def incorporate_related_insights(related: list[dict]) -> list[str]:
 # ── Uncertainty-aware distillation ────────────────────────────────────────────
 
 def distill_insights_n_times(tree: dict, brief: str, n: int = DISTILLATION_RUNS) -> dict:
-    """Run distillation N times, aggregate results for consensus."""
+    """Run distillation N times in parallel, aggregate results for consensus."""
     all_insights = []
     all_failures = []
     all_questions = []
 
-    for i in range(n):
+    def run_distillation_pass(i: int) -> dict:
         run_prompt = f"""Distill the key insights from this MCTS exploration:
 
 BRIEF: {brief}
@@ -497,11 +576,17 @@ Respond with ONLY JSON:
         response = call_hermes(run_prompt, timeout=90)
         result = parse_json_response(response)
         if result:
+            return result
+        return {"insights": [], "failures": [], "questions": []}
+
+    # Parallelize N distillation passes (5x speedup)
+    with ThreadPoolExecutor(max_workers=min(n, 5)) as executor:
+        futures = [executor.submit(run_distillation_pass, i) for i in range(n)]
+        for future in as_completed(futures):
+            result = future.result()
             all_insights.extend(result.get("insights", []))
             all_failures.extend(result.get("failures", []))
             all_questions.extend(result.get("questions", []))
-
-        time.sleep(1)
 
     # Find consensus: insights appearing 2+ times
     insight_counts: dict[str, int] = {}
@@ -637,7 +722,7 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
         meta["best_confidence"] = best_confidence
         write_meta(dream_id, meta)
 
-        # MetaRAG Monitor
+        # MetaRAG state (shared across all three calls)
         state = {
             "brief": brief,
             "iteration": iteration,
@@ -646,22 +731,28 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
             "active_branches": len([n for n in tree["nodes"] if n.get("n_visits", 0) > 0]),
             "tree_summary": tree_summary(tree),
         }
-        monitor = metarag_monitor(state)
+        # MetaRAG: run all three in parallel — wait() ensures true parallel execution
+        alternatives = [n["approach"][:50] for n in tree["nodes"][1:6]]
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            f_monitor = executor.submit(metarag_monitor, state)
+            f_evaluate = executor.submit(metarag_evaluate, state, alternatives)
+            f_plan = executor.submit(metarag_plan, state)
+            wait([f_monitor, f_evaluate, f_plan], return_when=ALL_COMPLETED)
+            monitor = f_monitor.result()
+            eval_result = f_evaluate.result()
+            plan = f_plan.result()
+        del executor  # Ensure cleanup before next iteration
+
         if iteration > 3 and not monitor.get("productive", True):
             print(f"  [MONITOR] Not productive: {monitor.get('reason', '')}")
             concerns = monitor.get("concerns", [])
             if concerns:
                 all_questions.extend(concerns)
 
-        # MetaRAG Evaluate
-        alternatives = [n["approach"][:50] for n in tree["nodes"][1:6]]
-        eval_result = metarag_evaluate(state, alternatives)
         if iteration > 2 and not eval_result.get("stay_the_course", True):
             switch_to = eval_result.get("switch_to")
             print(f"  [EVALUATE] Switching approach: {switch_to}")
 
-        # MetaRAG Plan
-        plan = metarag_plan(state)
         planned_action = plan.get("action", "expand_more")
         print(f"  [PLAN] {planned_action}: {plan.get('reason', '')}")
 
@@ -690,30 +781,35 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
             print(f"  [EXPAND] No children — wrapping up")
             planned_action = "wrap_up"
 
-        # ROLLOUT: run N rollouts per child
-        run_results = []
+        # ROLLOUT: run all rollouts in parallel, then backpropagate sequentially
+        # (backprop must be sequential to avoid race conditions on shared tree dict)
+        rollout_tasks = []
         for child_id in child_ids:
             child = next((n for n in tree["nodes"] if n["node_id"] == child_id), None)
             if not child:
                 continue
-
             child_approach = {
                 "approach_id": child_id,
                 "label": child.get("approach", ""),
                 "description": child.get("approach_desc", ""),
             }
-
             for r in range(ROLLOUTS_PER_NODE):
-                result = rollout(child_approach, brief, iteration)
-                outcome = result.get("outcome_float", 0.5)
-                child["n_visits"] = child.get("n_visits", 0) + 1
-                child["wins"] = child.get("wins", 0.0) + outcome
+                fid = executor.submit(rollout, child_approach, brief, iteration)
+                rollout_tasks.append((fid, child_id, child))
 
-                # Backpropagate
-                mcts_backpropagate(tree, child_id, outcome)
-                run_results.append(result)
-
-                print(f"  [ROLLOUT] {child.get('approach', '')[:40]} → {result.get('outcome', '?')} ({outcome:.2f})")
+        # Wait for all rollouts to complete (runs truly in parallel)
+        with ThreadPoolExecutor(max_workers=ROLLOUTS_PER_NODE) as rollout_ex:
+            for fid, child_id, child in rollout_tasks:
+                try:
+                    result = fid.result()
+                    outcome = result.get("outcome_float", 0.5)
+                    child["n_visits"] = child.get("n_visits", 0) + 1
+                    child["wins"] = child.get("wins", 0.0) + outcome
+                    mcts_backpropagate(tree, child_id, outcome)
+                    run_results.append(result)
+                    print(f"  [ROLLOUT] {child.get('approach', '')[:40]} → {result.get('outcome', '?')} ({outcome:.2f})")
+                except Exception as e:
+                    print(f"  [ROLLOUT] Error: {e}")
 
         # Update best confidence
         for node in tree["nodes"]:
@@ -738,6 +834,12 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
 
         if consecutive_no_progress >= 3:
             print(f"  [TERM] No progress for 3 iterations — wrapping up")
+            break
+
+        # Ralph-loop time-based staleness check
+        stale = detect_staleness(tree)
+        if stale.get("stale"):
+            print(f"  [TERM] Stale dream detected: {stale.get('reason')} — wrapping up")
             break
 
         print(f"  Confidence so far: {best_confidence:.2f}")

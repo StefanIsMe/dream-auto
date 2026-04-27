@@ -15,7 +15,6 @@ import json
 import os
 import psutil
 import re
-import shutil
 import sqlite3
 import subprocess
 import time
@@ -25,7 +24,7 @@ from typing import Optional
 
 DREAM_DIR = Path.home() / ".hermes" / "state" / "dream"
 DB_PATH = Path.home() / ".hermes" / "state" / "dream" / "session_index.db"
-HERMES_BIN = shutil.which("hermes") or str(Path.home() / ".local" / "bin" / "hermes")
+HERMES_BIN = Path.home() / ".local" / "bin" / "hermes"
 
 GMT7 = timezone(timedelta(hours=7))
 
@@ -66,14 +65,17 @@ class ResourceMonitor:
         """Count active hermes sessions (TTY users)."""
         try:
             result = subprocess.run(
-                ["hermes", "sessions", "list", "--json"],
+                ["hermes", "sessions", "list"],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
             if result.returncode == 0:
-                data = json.loads(result.stdout)
-                return len(data.get("sessions", []))
+                # Output format: "Preview ... Last Active ... Src ... ID" with separator line
+                # Count non-empty, non-header, non-separator lines
+                lines = [l for l in result.stdout.strip().split("\n")
+                         if l.strip() and not l.strip().startswith("─") and not l.strip().startswith("Preview")]
+                return len(lines)
         except Exception:
             pass
         return 0
@@ -82,15 +84,16 @@ class ResourceMonitor:
         """Count active cron jobs."""
         try:
             result = subprocess.run(
-                ["hermes", "cron", "status", "--json"],
+                ["hermes", "cron", "status"],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
             if result.returncode == 0:
-                data = json.loads(result.stdout)
-                jobs = data.get("jobs", [])
-                return sum(1 for j in jobs if j.get("status") == "running")
+                # Parse "N active job(s)" from output
+                match = re.search(r"(\d+)\s+active\s+job", result.stdout)
+                if match:
+                    return int(match.group(1))
         except Exception:
             pass
         return 0

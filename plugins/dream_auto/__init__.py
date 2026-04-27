@@ -31,12 +31,31 @@ logger = logging.getLogger(__name__)
 ENABLED_ENV  = "DREAM_AUTO_ENABLED"
 VERBOSE_ENV  = "DREAM_AUTO_VERBOSE"
 MAX_INJECT_ENV = "DREAM_AUTO_MAX_INJECT"
+THROTTLE_ENV = "DREAM_AUTO_THROTTLE_TURNS"  # fire hook at most every N turns (default 5)
 
 GMT7 = timezone(timedelta(hours=7))
 DREAM_DIR = Path.home() / ".hermes" / "state" / "dream"
 DREAM_QUEUE_DB = Path.home() / ".hermes" / "state" / "dream" / "dream_queue.db"
+KNOWLEDGE_CACHE_DB = Path.home() / ".hermes" / "state" / "dream" / "knowledge_cache.db"
 
 _session_injected: Dict[str, Set[str]] = {}  # session_id → set of dream_ids
+_session_turn_counter: Dict[str, int] = {}  # session_id → turn count since last dream check
+
+# ── Cached fast_path import (avoid re-import on every hook call) ───────────────
+_fast_path_module = None
+def _get_fast_path():
+    global _fast_path_module
+    if _fast_path_module is None:
+        try:
+            from pathlib import Path as P
+            import sys
+            sys.path.insert(0, str(P.home() / ".hermes" / "skills" / "autonomous-ai-agents" / "hermes-dream-task" / "scripts"))
+            from fast_path import should_dream_fast
+            _fast_path_module = should_dream_fast
+        except Exception as e:
+            logger.debug(f"dream_auto: fast_path unavailable — {e}")
+            _fast_path_module = None
+    return _fast_path_module
 
 
 def _enabled() -> bool:
@@ -50,6 +69,12 @@ def _max_inject() -> int:
         return int(os.environ.get(MAX_INJECT_ENV, "3"))
     except ValueError:
         return 3
+
+def _throttle_turns() -> int:
+    try:
+        return int(os.environ.get(THROTTLE_ENV, "5"))
+    except ValueError:
+        return 5
 
 
 # ── File helpers ─────────────────────────────────────────────────────────────
@@ -80,6 +105,77 @@ def _read_meta(dream_id: str) -> dict:
 
 def _read_pending_questions(dream_id: str) -> List[str]:
     return _read_json(_dream_path(dream_id) / "pending_questions.json", default=[])
+
+
+def _read_knowledge_cache(topic_hints: list[str] = None, limit: int = 3, session_id: str = None) -> List[str]:
+    """
+    Read entries from the predictive knowledge cache.
+    Returns up to `limit` formatted entries, filtered by topic hints if provided.
+    Tracks which sessions have been injected to avoid re-injecting.
+    """
+    if not KNOWLEDGE_CACHE_DB.exists():
+        return []
+
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(KNOWLEDGE_CACHE_DB))
+        # Ensure indexes exist for query efficiency
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_topic_cached ON knowledge_cache(topic, cached_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cached ON knowledge_cache(cached_at DESC)")
+        except Exception:
+            pass
+
+        # 7-day TTL — skip entries older than this
+        age_cutoff = (datetime.now(GMT7) - timedelta(days=7)).isoformat()
+
+        if topic_hints:
+            # Match entries by topic, most recent first, within TTL
+            placeholders = ",".join(["?"] * len(topic_hints))
+            rows = conn.execute(f"""
+                SELECT content, source, topic, cached_at, injected_sessions, content_hash
+                FROM knowledge_cache
+                WHERE topic IN ({placeholders})
+                AND cached_at > ?
+                ORDER BY cached_at DESC
+                LIMIT ?
+            """, (*topic_hints, age_cutoff, limit * 2)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT content, source, topic, cached_at, injected_sessions, content_hash
+                FROM knowledge_cache
+                WHERE cached_at > ?
+                ORDER BY cached_at DESC
+                LIMIT ?
+            """, (age_cutoff, limit * 2)).fetchall()
+
+        conn.close()
+
+        results = []
+        seen_hashes = set()
+        for content, source, topic, cached_at, injected_sessions, content_hash in rows:
+            # Skip duplicates by content hash
+            if content_hash and content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
+
+            # Skip if this session already received this entry
+            if session_id and injected_sessions:
+                try:
+                    injected_list = json.loads(injected_sessions)
+                    if session_id in injected_list:
+                        continue
+                except Exception:
+                    pass
+
+            if len(results) >= limit:
+                break
+            results.append(f"[KNOWLEDGE CACHE — {source} — {topic}]\n{content[:500]}")
+
+        return results
+
+    except Exception:
+        return []
 
 def _list_completed_dreams() -> List[dict]:
     """List all completed dreams for insight injection."""
@@ -232,12 +328,25 @@ def _on_pre_llm_call(
     """
     HOOK 1: Inject distilled insights from completed dreams.
     NO longer auto-starts dreams here — scheduler handles that.
+    FAST PATH: skip all work for trivially simple queries.
     """
     if not _enabled() or not user_message or len(user_message.strip()) < 5:
         return None
 
     if not DREAM_DIR.exists():
         return None
+
+    # ── FAST PATH: bypass file I/O for trivially simple queries ─────────────────
+    # _list_completed_dreams() does a full DREAM_DIR scan (~45ms on 652 dirs).
+    # Skip it entirely for queries that can't benefit from dream insights.
+    _fast = _get_fast_path()
+    if _fast is not None:
+        try:
+            is_fast, _ = _fast(user_message)
+            if is_fast:
+                return None  # Nothing to inject for simple queries
+        except Exception:
+            pass  # fast_path failed — proceed with normal path
 
     parts = []
     completed = _list_completed_dreams()
@@ -254,6 +363,27 @@ def _on_pre_llm_call(
 
     if session_id:
         _session_injected[session_id] = injected
+
+    # ── Knowledge cache: predictive pre-warmed context ────────────────────────
+    # Extract topic hints from user message
+    _topic_keywords = {
+        "linkedin": ["linkedin", "li_at", "org2", "social post", "engagement"],
+        "research": ["research", "arxiv", "paper", "study", "academic"],
+        "coding": ["python", "javascript", "typescript", "rust", "debug", "api", "coding"],
+        "browser": ["chrome", "cdp", "selenium", "scraper", "camoufox", "browser"],
+        "database": ["sqlite", "postgres", "sql", "db", "query", "database"],
+        "hermes": ["hermes", "agent", "cron", "plugin", "hook", "delegate"],
+        "web": ["website", "seo", "cloudflare", "deployment", "http", "web"],
+        "vietnam": ["vietnam", "hcmc", "tay ninh", "vnd"],
+        "content": ["article", "blog", "writing", "seo", "content"],
+        "ai": ["llm", "gpt", "claude", "model", "ai", "inference"],
+    }
+    msg_lower = user_message.lower()
+    topic_hints = [t for t, kws in _topic_keywords.items() if any(kw in msg_lower for kw in kws)]
+    knowledge_entries = _read_knowledge_cache(topic_hints=topic_hints, limit=2, session_id=session_id)
+    if knowledge_entries:
+        parts.append("[KNOWLEDGE CACHE — pre-warmed from session index]\n" +
+                     "\n".join(knowledge_entries))
 
     if not parts:
         return None
@@ -335,33 +465,39 @@ def _on_post_llm_call(
     **kwargs: Any,
 ) -> Optional[dict]:
     """
-    HOOK 4: Complex question → add to dream queue.
-    NO entropy gate, NO MIN_COMPLEXITY. Fast-path分流 handles skipping simple stuff.
-    Scheduler decides when to actually start the dream.
+    HOOK 4: Throttled dream enqueue — fast-path check only, no heavy processing.
+    All actual MCTS reasoning happens in dream_loop_v3.py via delegate_task.
     """
     if not _enabled():
         return None
+
+    if not session_id:
+        return None
+
+    # ── Throttle: only check every N turns ────────────────────────────────────
+    counter = _session_turn_counter.get(session_id, 0) + 1
+    _session_turn_counter[session_id] = counter
+    if counter < _throttle_turns():
+        return None
+    _session_turn_counter[session_id] = 0  # reset after check
 
     # Only trigger on substantial user messages
     if not user_message or len(user_message.strip()) < 30:
         return None
 
-    # Try fast_path分流
-    try:
-        from pathlib import Path as P
-        import sys
-        
-        _fp = str(P.home() / ".hermes" / "skills" / "autonomous-ai-agents" / "hermes-dream-task" / "scripts")
-        if _fp not in sys.path:
-            sys.path.insert(0, _fp)
-        from fast_path import should_dream_fast
-        is_fast, reason = should_dream_fast(user_message)
-        if is_fast:
-            return None  # fast path — no dreaming
-    except Exception:
-        pass  # fast_path unavailable — proceed
+    # ── Fast-path分流: skip simple stuff ──────────────────────────────────────
+    fast_path_fn = _get_fast_path()
+    if fast_path_fn is not None:
+        try:
+            is_fast, reason = fast_path_fn(user_message)
+            if is_fast:
+                if _verbose():
+                    logger.info(f"dream_auto v3: fast-path skip — {reason}")
+                return None
+        except Exception:
+            pass  # fast_path failed — proceed cautiously
 
-    # Add to scheduler queue (scheduler handles timing)
+    # ── Enqueue only: all reasoning happens asynchronously in dream_loop_v3 ──
     brief = (
         f"Explore and think deeply about: {user_message[:500]}\n\n"
         f"Approach: structured exploration with multiple reasoning branches.\n"
@@ -370,7 +506,7 @@ def _on_post_llm_call(
     dream_id = _add_to_queue(session_id or "unknown", brief, grade=0.7, priority=0.7)
 
     if _verbose():
-        logger.info(f"dream_auto v3: queued complex-question dream {dream_id}")
+        logger.info(f"dream_auto v3: queued dream {dream_id} after {counter} turns")
 
     return {
         "context": (
@@ -401,6 +537,7 @@ def _on_session_start(
                        f"best: {best['id']}(conf={best['confidence']:.0%})")
 
         _session_injected.pop(session_id, None)
+        _session_turn_counter.pop(session_id, None)
 
     except Exception as e:
         logger.debug(f"dream_auto v3 session_start failed: {e}")
@@ -417,3 +554,4 @@ def _on_session_end(
         return
 
     _session_injected.pop(session_id, None)
+    _session_turn_counter.pop(session_id, None)

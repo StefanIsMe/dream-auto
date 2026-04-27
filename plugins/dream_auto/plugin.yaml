@@ -1,7 +1,27 @@
 name: dream_auto
-version: "1.0.0"
-description: Aggressive hermes-dream integration. Auto-injects dream thinking into context, auto-starts dreams for complex questions/errors/knowledge gaps, feeds session learnings back into dreams, wakes dreams on topic match. 6 hook points.
-author: Hermes
+version: "3.0.0"
+description: |
+  Dream System v3 Plugin — MCTS background reasoning engine.
+
+  Architecture:
+    - Hooks fire synchronously in the agent (fast-path + enqueue only)
+    - All heavy MCTS reasoning runs async via dream_loop_v3.py (delegate_task)
+    - Scheduler decides when to start dreams based on resource availability
+
+  Hook breakdown:
+    - pre_llm_call: inject completed dream insights (fast, no LLM call)
+    - pre_tool_call: suggest dreaming on complex execute_code (fast, no LLM call)
+    - post_tool_call: error-triggered dream enqueue (fast, no LLM call)
+    - post_llm_call: throttled complex-question enqueue — checks every N turns (default 5)
+    - on_session_start: log active dreams (fast)
+    - on_session_end: clean up session state (fast)
+
+  Env vars:
+    DREAM_AUTO_ENABLED=1       — disable entirely
+    DREAM_AUTO_VERBOSE=1       — log activity
+    DREAM_AUTO_MAX_INJECT=3    — max dreams to inject per turn (default 3)
+    DREAM_AUTO_THROTTLE_TURNS=5 — post_llm_call fires at most every N turns (default 5)
+
 provides_hooks:
   - pre_llm_call
   - pre_tool_call

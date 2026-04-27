@@ -15,6 +15,7 @@ Usage:
     is_fast, reason = should_dream_fast("your question here")
 """
 
+import json
 import re
 from typing import Tuple
 
@@ -211,6 +212,3 @@ if __name__ == "__main__":
 
     result = classify(query)
     print(json.dumps(result, indent=2, ensure_ascii=False))
-
-
-import json
