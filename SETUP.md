@@ -24,7 +24,7 @@ Paste this into your Hermes chat:
 Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the setup steps to install Dream Auto v3 on this machine. Execute all steps. Report what was installed.
 ```
 
-Existing Dream Auto user? Same prompt works — it detects what is already there and upgrades cleanly.
+Existing Dream Auto user? The All-in-One command and step-by-step section both detect what is already there and upgrade cleanly — no re-clone, no data loss.
 
 ---
 
@@ -437,6 +437,35 @@ hermes cron list
 ```
 
 All should respond without error.
+
+---
+
+## Upgrading from Any Version (Including v3.0.x → Latest)
+
+If Dream Auto is already installed, running the All-in-One command (or re-running Steps 4 and 5) upgrades cleanly:
+
+```bash
+cd ~/dream-auto
+git pull
+
+# Re-copy all files (Step 4 in full below)
+rm -rf ~/.hermes/plugins/dream_auto
+rm -rf ~/.hermes/skills/autonomous-ai-agents/hermes-dream-task
+rm -rf ~/.hermes/skills/ops/dream-system-v3
+cp -r ~/dream-auto/plugins/dream_auto ~/.hermes/plugins/
+cp ~/dream-auto/scripts/*.py ~/.hermes/scripts/
+cp -r ~/dream-auto/skills/autonomous-ai-agents/hermes-dream-task ~/.hermes/skills/autonomous-ai-agents/
+cp -r ~/dream-auto/skills/ops/dream-system-v3 ~/.hermes/skills/ops/
+
+# Step 5 — DB init (safe to re-run on existing DBs)
+# No data loss, no re-clone
+```
+
+After upgrading, run the scheduler once manually to apply the completion-detection fix:
+
+```bash
+python3 ~/.hermes/scripts/dream_scheduler.py
+```
 
 ---
 
