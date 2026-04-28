@@ -269,46 +269,35 @@ Reason: {session_data.get('reason', 'not evaluated')[:200]}
 
 # ── Dynamic concurrency ───────────────────────────────────────────────────────
 
+def decide_concurrency(state: dict) -> int:
+    """
+    Rule-based concurrency decision — no LLM call needed.
+    CPU/RAM thresholds determine how many additional dreams can run.
+    """
+    cpu = state["cpu_percent"]
+    ram = state["ram_percent"]
+    active = state.get("active_sessions", 0)
+    running = state["active_dreams"]
+
+    # Critical: no new dreams
+    if cpu >= 90 or ram >= 95:
+        return 0
+    # High load: allow 1 more at most
+    if cpu >= 75 or ram >= 85:
+        return max(0, min(1, 5 - running))
+    # Moderate load: allow 2 more
+    if cpu >= 50 or ram >= 70:
+        return max(0, min(2, 5 - running))
+    # Low load: allow up to 3 more (but not more than available slots)
+    return max(0, min(3, 5 - running))
+
+
 def llm_decide_concurrency(state: dict) -> int:
     """
-    Ask the LLM how many dreams can run concurrently given current resources.
-    One call per scheduler cycle (every 30 min). Returns recommended count.
+    Deprecated: hermes chat -q hangs in non-TTY subprocess context.
+    Use decide_concurrency() instead — same logic, no LLM call.
     """
-    prompt = (
-        f"You are a resource scheduler. Current system state:\n"
-        f"- CPU usage: {state['cpu_percent']:.0f}%\n"
-        f"- RAM usage: {state['ram_percent']:.0f}%\n"
-        f"- Active Hermes sessions: {state['active_sessions']}\n"
-        f"- Active cron jobs: {state['active_crons']}\n"
-        f"- Dreams currently running: {state['active_dreams']}\n"
-        f"Each dream spawns a subprocess that calls 'hermes chat -q' for LLM reasoning.\n"
-        f"How many ADDITIONAL dreams should start now?\n"
-        f"Answer JSON only: {{\"max_concurrent\": N, \"reason\": \"brief explanation\"}}"
-    )
-    try:
-        result = subprocess.run(
-            [HERMES_BIN, "chat", "-q", prompt],
-            capture_output=True, text=True, timeout=30,
-            cwd=str(Path.home()),
-        )
-        output = result.stdout
-        # Find last JSON object with max_concurrent
-        for match in __import__("re").finditer(
-            r'\{"max_concurrent":\s*(\d+),\s*"reason":\s*"[^"]*"\}', output
-        ):
-            try:
-                data = json.loads(match.group())
-                count = int(data.get("max_concurrent", 1))
-                reason = data.get("reason", "LLM decision")
-                print(f"  [LLM] Recommends {count} additional dreams — {reason}")
-                return max(0, count)
-            except Exception:
-                continue
-    except subprocess.TimeoutExpired:
-        print("  [LLM] Concurrency decision timed out — falling back to 1")
-    except Exception as e:
-        print(f"  [LLM] Concurrency decision failed: {e} — falling back to 1")
-    return 1
+    return decide_concurrency(state)
 
 
 def check_resources_and_concurrency():
@@ -332,14 +321,14 @@ def check_resources_and_concurrency():
         if running >= 5:
             return False, f"{running} dreams already running (safety cap)", 0
 
-        # Dynamic: ask LLM for concurrency decision
+        # Dynamic: rule-based concurrency decision
         state["active_dreams"] = running
-        max_additional = llm_decide_concurrency(state)
+        max_additional = decide_concurrency(state)
 
         if max_additional <= 0:
-            return False, f"LLM recommends 0 additional dreams", 0
+            return False, f"no concurrency slots available", 0
 
-        return True, f"Resources OK, LLM allows {max_additional} more", max_additional
+        return True, f"Resources OK, {max_additional} slot(s) available", max_additional
 
     except Exception as e:
         print(f"  [RESOURCE] Fallback check: {e}")
@@ -479,12 +468,36 @@ def run_scheduler_cycle(dry_run: bool = False) -> dict:
     return results
 
 
+def decide_sleep_seconds(base_minutes: int, cpu: float, ram: float, running: int, queued_count: int) -> int:
+    """
+    Rule-based adaptive sleep — no LLM call needed.
+    Returns seconds to sleep. Shorter when queue backs up + resources free.
+    """
+    slots_free = max(0, 5 - running)
+
+    # Queue backed up + resources free → fast turnaround
+    if queued_count > 100 and cpu < 50 and ram < 70:
+        return 2 * 60
+    if queued_count > 100 and (cpu < 75 and ram < 85):
+        return 5 * 60
+
+    # Moderate queue + resources OK
+    if queued_count > 10:
+        return 10 * 60
+
+    # Queue nearly empty or resources tight → slow down
+    if queued_count > 0:
+        return base_minutes * 60
+
+    # Nothing queued → long sleep
+    return 60 * 60
+
+
 def adaptive_sleep(base_minutes: int = 30) -> int:
     """
-    Ask the LLM how long the daemon should sleep before next cycle.
+    Rule-based adaptive sleep — no LLM call needed.
     Returns seconds to sleep. Range: 2 min (turbo) to 60 min (idle).
-    Shorter sleep when queue is backed up and resources are good.
-    Longer sleep when idle or resources are tight.
+    Shorter sleep when queue backs up and resources are free.
     """
     try:
         from resource_monitor import ResourceMonitor
@@ -499,38 +512,11 @@ def adaptive_sleep(base_minutes: int = 30) -> int:
         queued_count = conn.execute("SELECT COUNT(*) FROM dream_queue WHERE status = 'queued'").fetchone()[0]
         conn.close()
 
-        prompt = (
-            f"You are a scheduler daemon. Current state:\n"
-            f"- CPU: {cpu:.0f}% | RAM: {ram:.0f}%\n"
-            f"- Dreams running: {running}\n"
-            f"- Dreams queued: {queued_count}\n"
-            f"Base interval is {base_minutes} minutes.\n"
-            f"How many minutes until the next check? Consider:\n"
-            f"- If queue is large and resources are free → check sooner\n"
-            f"- If queue is empty or resources are tight → check later\n"
-            f"Answer JSON only: {{\"sleep_minutes\": N, \"reason\": \"brief\"}}"
-        )
-        result = subprocess.run(
-            [HERMES_BIN, "chat", "-q", prompt],
-            capture_output=True, text=True, timeout=15,
-            cwd=str(Path.home()),
-        )
-        output = result.stdout
-        for match in __import__("re").finditer(
-            r'\{"sleep_minutes":\s*(\d+),\s*"reason":\s*"[^"]*"\}', output
-        ):
-            try:
-                data = json.loads(match.group())
-                minutes = int(data.get("sleep_minutes", base_minutes))
-                reason = data.get("reason", "LLM decision")
-                # Clamp: 2 min minimum (turbo), 60 min maximum (idle)
-                minutes = max(2, min(60, minutes))
-                print(f"  [LLM] Next check in {minutes} min — {reason}")
-                return minutes * 60
-            except Exception:
-                continue
+        seconds = decide_sleep_seconds(base_minutes, cpu, ram, running, queued_count)
+        print(f"  [SCHEDULER] Next check in {seconds // 60} min (queue={queued_count}, cpu={cpu:.0f}%, ram={ram:.0f}%)")
+        return seconds
     except Exception as e:
-        print(f"  [LLM] Adaptive sleep failed: {e} — using base {base_minutes} min")
+        print(f"  [SCHEDULER] Adaptive sleep error: {e} — using base {base_minutes} min")
     return base_minutes * 60
 
 
