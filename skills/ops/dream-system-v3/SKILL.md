@@ -2,7 +2,7 @@
 name: dream-system-v3
 description: "Dream System v3 — MCTS background thinking engine. Scripts: session_indexer.py, session_grader.py, dream_loop_v3.py, fast_path.py, resource_monitor.py, dream_scheduler.py. See state/dream/ for DBs."
 tags: "background-thinking,mcts,dream,scheduler"
-updated-on: "2026-04-27"
+updated-on: "2026-04-28"
 ---
 
 # Dream System v3 — Implementation Reference
@@ -54,7 +54,7 @@ INSIGHTS → injected on pre_llm_call
 | `skills/.../scripts/fast_path.py` | Heuristic分流 (no LLM) for simple queries |
 | `plugins/dream_auto/resource_monitor.py` | CPU/RAM check + LLM fallback |
 | `plugins/dream_auto/__init__.py` | Plugin v3: insight injection + error→queue |
-| `scripts/dream_scheduler.py` | Adaptive queue manager + spawner. LLM decides concurrency and cadence |
+| `scripts/dream_scheduler.py` | Adaptive queue manager + spawner. Rule-based concurrency (CPU/RAM) and cadence (queue depth). Detects dream completion and syncs queue DB. |
 | `state/dream/SYSTEM_PAUSE` | Flag file — running dreams wait, scheduler skips when present |
 | `state/dream/session_index.db` | Indexed sessions with grades |
 | `state/dream/dream_queue.db` | Queued dreams (created at runtime) |
@@ -63,15 +63,15 @@ INSIGHTS → injected on pre_llm_call
 
 | Job | Schedule | Purpose |
 |-----|----------|---------|
-| `dream-scheduler` (c1ca480f0de4) | Every 30min (base) | Check resources → start queued dreams. **Actual interval is adaptive** — LLM decides 2–60 min per cycle |
+| `dream-scheduler` (c1ca480f0de4) | Every 30min (base, adaptive 2–60 min via rule-based sleep) | Check resources → start queued dreams. Syncs queue DB for completed dreams. |
 | `session-indexer` (8c86be7295a1) | Every 6h | Index new sessions + grade them |
 
 ## Resource Governance (Three Layers)
 
-The system uses adaptive, LLM-driven resource management — not fixed intervals or hardcoded thresholds. Only physical safety caps are hardcoded.
+The system uses adaptive, rule-based resource management — physical safety caps + heuristic thresholds for concurrency and cadence. LLM only used for session grading (session_grader.py), not scheduler decisions.
 
-### Layer 1: Dynamic Concurrency (Scheduler)
-Every cycle, the scheduler asks the LLM: *"How many additional dreams should start now?"*
+### Layer 1: Rule-Based Concurrency (Scheduler)
+Every cycle, the scheduler uses a heuristic: CPU free ≥ 50% AND RAM free ≥ 30% → recommend 0-3 additional concurrent dreams based on load magnitude. No LLM call.
 - Hard safety caps: **max 5 concurrent**, stops at CPU ≥ 90% or RAM ≥ 95%
 - Fills slots from queue first, then from highest-potential sessions
 
@@ -83,10 +83,9 @@ Each dream checks `psutil` between every MCTS iteration:
 - Low load → sleeps **10–30 seconds** (turbo mode)
 - Dreams also check for `SYSTEM_PAUSE` flag file
 
-### Layer 3: Adaptive Daemon Cadence
-Instead of fixed 30-minute sleep, the daemon asks the LLM after every cycle: *"How many minutes until the next check?"*
-- Range: **2 minutes** (turbo, queue backed up + resources free) to **60 minutes** (idle, nothing to do)
-- Falls back to base interval if LLM call fails
+### Layer 3: Adaptive Daemon Cadence (Rule-Based)
+After every cycle, the daemon uses a rule-based sleep: 2 min (queue backed up 100+, CPU/RAM OK) → 5 min (queue 100+, moderate load) → 10 min (queue 10+) → 60 min (queue empty). No LLM call.
+- Falls back to base interval if resource check fails
 
 ### Emergency Pause
 Create a pause flag to make all running dreams wait and the scheduler skip:
@@ -99,7 +98,7 @@ rm ~/.hermes/state/dream/SYSTEM_PAUSE      # resume
 
 - **Holographic dual stores** — fact_store (entity) vs memory (document). Dream insights land in memory via holographic_auto's 7-hook pipeline.
 - **Plugin hook composability** — Three confirmed hooks for insight injection: `pre_llm_call`, `on_llm_call`, `post_llm_call`. Configurable via `holographic_auto` plugin flags.
-- **No hardcoded thresholds** — LLM decides when ambiguous
+- **No hardcoded thresholds** — heuristic rules for scheduler decisions
 - **Resource availability is ONLY gate** — scheduler runs dreams when CPU/RAM free
 - **SwiftSage fast path** — pure heuristics, zero LLM latency for simple queries
 - **Monte Carlo for decisions** — MCTS for complex multi-branch reasoning
@@ -175,7 +174,9 @@ The `CREATE INDEX IF NOT EXISTS` statements are now in the schema definitions in
 **Adaptive C:** `C_adaptive = 1.414 * (1 + 1/sqrt(parent_visits))` — starts higher for young trees (aggressive exploration), shrinks as tree matures (exploitation).
 
 ### Wallclock Killer — Scheduler Enforcement (2026-04-27)
-`kill_stale_dreams()` in `dream_scheduler.py`: called at the start of every scheduler cycle. Kills any dream running longer than `MAX_DREAM_WALLCLOCK_MINUTES = 30`. Marks `status.txt` as `killed_wallclock`, updates queue DB to `killed_wallclock` status so it doesn't retry. Works independently of per-dream staleness detection — this is a global scheduler safety net.
+`sync_dream_status()` in `dream_scheduler.py`: called at the start of every scheduler cycle. Does two jobs in one pass over DREAM_DIR:
+1. **Completion detector** — if `meta.json` shows `status=done/completed` but queue DB says `running`, promotes queue DB to `completed`. This is the code path that drains the queue when dreams finish normally.
+2. **Wallclock enforcer** — kills any dream running longer than `MAX_DREAM_WALLCLOCK_MINUTES = 30`. Marks `status.txt` as `killed_wallclock`, updates queue DB to `killed_wallclock` status so it doesn't retry.
 
 ### SQLite Indexes (live DBs, applied 2026-04-27)
 
@@ -187,10 +188,10 @@ The `CREATE INDEX IF NOT EXISTS` statements are now in the schema definitions in
 - If missing, every dream crashes immediately with `ModuleNotFoundError: No module named 'psutil'` before any MCTS work begins.
 
 **Stale "running" status blocking scheduler:**
-- Crashed dreams leave `status.txt` as `running` and `dream_queue.db` status as `running`.
+- Crashed dreams (or pre-fix completions) leave `status.txt` as `running` and `dream_queue.db` status as `running`.
 - The scheduler's `count_running_dreams()` counts these against the hard safety cap (max 5 concurrent).
 - Result: queue backs up even though no actual dream processes are alive.
-- Fix: mark crashed dreams as `failed`/`failed_crash` in both `status.txt` and the queue DB.
+- Fix: `sync_dream_status()` handles this on every cycle — completed dreams (meta.json status=done) get promoted to `completed` in queue DB. Crashed dreams (wallclock exceeded) get marked `killed_wallclock`.
 
 **dream_output.log stdout buffering:**
 - The scheduler spawns dreams with `stdout=open(dp / "dream_output.log", "w")` and `start_new_session=True`.
@@ -219,8 +220,8 @@ The `CREATE INDEX IF NOT EXISTS` statements are now in the schema definitions in
 - `SYSTEM_PAUSE` check: `os.path.exists("~/.hermes/state/dream/SYSTEM_PAUSE")` — if present, loop sleeps 30s and re-checks. Non-blocking pause.
 
 **dream_scheduler.py adaptive cadence:**
-- After each cycle, ask LLM: *"Given {stats}, how many minutes until next check?"* Parse as integer. Clamp to 2–60 range.
-- Fallback: if LLM call fails or returns non-integer, use base interval (30 min).
+- Rule-based: check CPU/RAM + queue depth to decide sleep seconds (2–60 min range).
+- Sleep tiers: 2 min (queue 100+, CPU/RAM OK), 5 min (queue 100+, moderate load), 10 min (queue 10+), 60 min (queue empty).
 - Cron still fires every 30 min, but the daemon's internal sleep may be shorter/longer. The cron ensures the daemon stays alive.
 
 **dream_queue.db location:**

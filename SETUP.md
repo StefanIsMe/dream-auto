@@ -2,7 +2,7 @@
 
 **For:** Hermes Agent (or any AI assistant with terminal/file access)
 **Repo:** https://github.com/StefanIsMe/dream-auto
-**Version:** 3.0.0
+**Version:** 3.0.1
 
 ---
 
@@ -503,7 +503,8 @@ dream-auto/
 | `hermes: command not found` | Install Hermes Agent first. Stop here. |
 | `pip3: command not found` | Install Python pip first. Stop here. |
 | `psutil` install fails | `sudo dnf install python3-devel` (Fedora) or `sudo apt install python3-dev` (Debian/Ubuntu) or `xcode-select --install` (macOS) |
-| `dream-dashboard` not found | `~/.local/bin` not in PATH. Use `python3 ~/.hermes/scripts/dream_insights_dashboard.py` instead. |
+| `dream-dashboard` not found | `~/.local/bin` not in your PATH. Use `python3 ~/.hermes/scripts/dream_insights_dashboard.py` instead. |
+| Queue shows dreams stuck "running" after completion | The scheduler's `sync_dream_status()` (v3.0.1+) syncs completed dreams from meta.json to the queue DB. Run `python3 ~/.hermes/scripts/dream_scheduler.py` once manually to trigger the sync. |
 | Cron jobs fail to register | Run `hermes gateway start` first. |
 | Dashboard shows no sessions | Run `python3 ~/.hermes/scripts/session_indexer.py --limit 50` manually. |
 | Dreams never start | Check resources: `python3 ~/.hermes/plugins/dream_auto/resource_monitor.py` |

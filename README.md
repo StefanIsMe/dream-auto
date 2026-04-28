@@ -35,7 +35,7 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
 | **Staleness Detection** | Dreams spinning without tree growth for 20+ minutes are cut off. |
 | **Wallclock Killer** | Scheduler kills any dream exceeding 30 minutes globally. |
 | **SQLite Performance Indexes** | Queue drains and session sorts are O(log n), not O(n). |
-| **Zero Hardcoded Thresholds** | Resource availability is the only gate. The LLM decides everything else. |
+| **Zero Hardcoded Thresholds** | Heuristic rules for concurrency/cadence. CPU/RAM availability is the only gate. |
 | **Error → Dream Pipeline** | Tool crashes automatically trigger troubleshooting dreams. |
 | **Rich CLI Dashboard** | `dream-dashboard` shows live stats, insights, queue status, and grades. |
 
