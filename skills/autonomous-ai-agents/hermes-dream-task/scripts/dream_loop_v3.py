@@ -426,7 +426,7 @@ def mcts_backpropagate(tree: dict, node_id: str, outcome: float):
         if n > 1:
             mean = node["wins"] / n
             node["confidence"] = round(mean, 3)
-            if n > 1:
+            if n > 2:
                 node["ci_width"] = round(1.0 / _math.sqrt(n), 3)
         cid = node.get("parent_id")
 
@@ -776,6 +776,7 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
         parent_node = next((n for n in tree["nodes"] if n["node_id"] == node_to_expand), None)
         depth = (parent_node.get("depth", 0) + 1) if parent_node else 1
 
+        planned_action = plan.get("action", "expand_more")
         child_ids = mcts_expand(tree, node_to_expand, brief, depth)
         if not child_ids:
             print(f"  [EXPAND] No children — wrapping up")
