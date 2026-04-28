@@ -695,6 +695,7 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
     all_insights = []
     all_failures = []
     all_questions = []
+    run_results = []
 
     write_json(dp / "exploration_tree.json", tree)
     write_json(dp / "insights.json", [])
