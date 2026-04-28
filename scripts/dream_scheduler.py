@@ -187,13 +187,15 @@ def add_to_queue(session_id: str, question: str, grade: float, priority: float =
 def get_session_with_highest_potential(limit: int = 10) -> list[dict]:
     """Get sessions that haven't been dreamed on yet, sorted by dream potential."""
     conn = sqlite3.connect(str(DB_PATH))
+    # Attach dream_queue.db so we can LEFT JOIN across both databases
+    conn.execute(f"ATTACH DATABASE '{DREAM_QUEUE_DB}' AS dream_queue_db")
     rows = conn.execute("""
         SELECT s.session_id, s.dream_potential, s.dream_potential_reason,
                s.open_questions, s.topics, s.unresolved,
                sq.dream_id IS NULL as undreamed
         FROM sessions s
         LEFT JOIN (
-            SELECT DISTINCT session_id, dream_id FROM dream_queue
+            SELECT DISTINCT session_id, dream_id FROM dream_queue_db.dream_queue
             UNION
             SELECT session_id, session_id as dream_id FROM sessions
             WHERE last_dreamed_at IS NOT NULL
