@@ -471,6 +471,36 @@ Pending dreams from v1/v2 survive the upgrade. The scheduler handles them normal
 
 ---
 
+## Upgrading from v3.0.0 → v3.0.1
+
+v3.0.1 is a pure bug-fix release. No schema changes, no file deletions, no data loss.
+
+```bash
+cd ~/dream-auto
+git pull
+
+# Re-copy the fixed files (all changes are in scripts/ and skills/)
+cp ~/dream-auto/scripts/dream_scheduler.py ~/.hermes/scripts/
+cp ~/dream-auto/skills/autonomous-ai-agents/hermes-dream-task/scripts/dream_loop_v3.py \
+    ~/.hermes/skills/autonomous-ai-agents/hermes-dream-task/scripts/
+
+# Trigger a manual scheduler run to sync the completion-detection fix
+# This promotes any dreams that completed under v3.0.0 but are still stuck "running" in the queue DB
+python3 ~/.hermes/scripts/dream_scheduler.py
+```
+
+After the manual run, `dream_queue.db` will be corrected and the scheduler will continue normally.
+
+What changed in v3.0.1:
+- **dream_scheduler.py**: `sync_dream_status()` replaces `kill_stale_dreams()` — now detects normally completed dreams and syncs the queue DB. Previously only wallclock-killed dreams were synced, so completed dreams stayed "running" in the queue forever, blocking concurrency slots.
+- **dream_scheduler.py**: LLM-based concurrency and sleep decisions replaced with rule-based heuristics (eliminates LLM timeout hangs from non-TTY subprocess context).
+- **dream_loop_v3.py**: 5 bug fixes — `executor` undefined reference, `run_results` undefined, `planned_action` ordering, CI-width guard `n>2`, `ThreadPoolExecutor` lifecycle fix.
+- **dream_scheduler.py**: `ATTACH DATABASE` fix for cross-DB join in `get_session_with_highest_potential()`.
+
+All databases are fully compatible — no migration needed.
+
+---
+
 ## Files in This Distribution
 
 ```
