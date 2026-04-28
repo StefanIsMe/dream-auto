@@ -1,4 +1,4 @@
-# Dream Auto Plugin — Setup Guide
+# Dream Auto v3.0.1 — Setup Guide
 
 **For:** Hermes Agent (or any AI assistant with terminal/file access)
 **Repo:** https://github.com/StefanIsMe/dream-auto
@@ -6,213 +6,38 @@
 
 ---
 
-## Before You Start
+## Execute These Steps in Order
 
-Dream Auto runs background MCTS reasoning dreams on your machine. It needs:
-- Python 3.10+
-- Hermes Agent installed (`hermes` CLI in PATH)
-- Hermes gateway running (for cron jobs)
-- Linux, macOS, or Windows WSL
+If Dream Auto is already installed, running these steps upgrades it. If it is not installed, these steps install it from scratch. Either way the result is the same: latest version, all files in place, databases ready.
 
 ---
 
-## Quick Install (Let Hermes Do It)
-
-Paste this into your Hermes chat:
-
-```
-Go to https://github.com/StefanIsMe/dream-auto/blob/main/SETUP.md and follow the setup steps to install Dream Auto v3 on this machine. Execute all steps. Report what was installed.
-```
-
-Existing Dream Auto user? The All-in-One command and step-by-step section both detect what is already there and upgrade cleanly — no re-clone, no data loss.
-
----
-
-## All-in-One Install / Upgrade Command
-
-If you prefer to run it yourself in one shot, copy and paste this entire block into your terminal:
+### STEP 1 — Prep
 
 ```bash
-# ── Dream Auto v3 — Install or Upgrade ──
-set -e
-
 HERMES_HOME="$HOME/.hermes"
 DREAM_AUTO_REPO="$HOME/dream-auto"
+STATE_DIR="$HERMES_HOME/state/dream"
+```
 
-# Clone if not present
+---
+
+### STEP 2 — Clone or Update the Repo
+
+```bash
 if [ ! -d "$DREAM_AUTO_REPO" ]; then
     git clone https://github.com/StefanIsMe/dream-auto.git "$DREAM_AUTO_REPO"
+else
+    cd "$DREAM_AUTO_REPO" && git pull
 fi
-
-cd "$DREAM_AUTO_REPO"
-git pull
-
-# Install deps
-pip3 install --user -r requirements.txt
-
-# Copy plugin files
-rm -rf "$HERMES_HOME/plugins/dream_auto"
-cp -r "$DREAM_AUTO_REPO/plugins/dream_auto" "$HERMES_HOME/plugins/"
-
-# Copy scripts
-for script in dream_scheduler.py dream_insights_dashboard.py session_indexer.py session_grader.py; do
-    cp "$DREAM_AUTO_REPO/scripts/$script" "$HERMES_HOME/scripts/"
-done
-
-# Copy skills
-rm -rf "$HERMES_HOME/skills/autonomous-ai-agents/hermes-dream-task"
-cp -r "$DREAM_AUTO_REPO/skills/autonomous-ai-agents/hermes-dream-task" \
-    "$HERMES_HOME/skills/autonomous-ai-agents/"
-
-rm -rf "$HERMES_HOME/skills/ops/dream-system-v3"
-cp -r "$DREAM_AUTO_REPO/skills/ops/dream-system-v3" \
-    "$HERMES_HOME/skills/ops/"
-
-# Init DBs (safe to run on existing DBs — adds indexes, preserves data)
-python3 - <<'PYEOF'
-import sqlite3, os
-STATE = os.path.expanduser("~/.hermes/state/dream")
-os.makedirs(STATE, exist_ok=True)
-os.makedirs(os.path.join(STATE, "logs"), exist_ok=True)
-
-DB_SCHEMAS = {
-    "session_index.db": {
-        "tables": """
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY, created_at TEXT, last_message_at TEXT,
-                message_count INTEGER DEFAULT 0, topics TEXT DEFAULT '[]',
-                had_errors INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0,
-                was_complex INTEGER DEFAULT 0, open_questions TEXT DEFAULT '[]',
-                unresolved TEXT DEFAULT '[]', dream_potential REAL,
-                dream_potential_reason TEXT, dreams_run TEXT DEFAULT '[]',
-                last_dreamed_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS indexed_runs (
-                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                indexed_at TEXT, session_count INTEGER, errors INTEGER
-            );
-        """,
-        "indexes": [
-            "CREATE INDEX IF NOT EXISTS idx_sessions_dream_potential ON sessions(dream_potential DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_sessions_had_errors     ON sessions(had_errors)",
-            "CREATE INDEX IF NOT EXISTS idx_sessions_last_dreamed  ON sessions(last_dreamed_at)",
-        ],
-    },
-    "dream_queue.db": {
-        "tables": """
-            CREATE TABLE IF NOT EXISTS dream_queue (
-                queue_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT,
-                dream_id TEXT UNIQUE, dream_question TEXT, grade REAL,
-                resource_cost INTEGER DEFAULT 1, priority REAL, created_at TEXT,
-                started_at TEXT, completed_at TEXT, status TEXT DEFAULT 'queued'
-            );
-        """,
-        "indexes": [
-            "CREATE INDEX IF NOT EXISTS idx_queue_status_priority ON dream_queue(status, priority DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_queue_dream_id       ON dream_queue(dream_id)",
-        ],
-    },
-    "knowledge_cache.db": {
-        "tables": """
-            CREATE TABLE IF NOT EXISTS knowledge_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, content TEXT,
-                source TEXT, cached_at TEXT, content_hash TEXT UNIQUE
-            );
-        """,
-        "indexes": [
-            "CREATE INDEX IF NOT EXISTS idx_topic_cached ON knowledge_cache(topic, cached_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_cached       ON knowledge_cache(cached_at DESC)",
-        ],
-    },
-}
-
-for db_name, schema in DB_SCHEMAS.items():
-    path = os.path.join(STATE, db_name)
-    conn = sqlite3.connect(path)
-    conn.executescript(schema["tables"])
-    for idx in schema["indexes"]:
-        conn.execute(idx)
-    conn.commit()
-    conn.close()
-    print(f"OK: {db_name}")
-PYEOF
-
-# Dashboard wrapper
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/dream-dashboard" <<'WRAPPER'
-#!/usr/bin/env bash
-exec python3 "$HOME/.hermes/scripts/dream_insights_dashboard.py" "$@"
-WRAPPER
-chmod +x "$HOME/.local/bin/dream-dashboard"
-
-# Register cron jobs (skip if already registered)
-hermes cron list 2>/dev/null | grep -q "dream-scheduler" || \
-    hermes cron create --name "dream-scheduler" \
-    --schedule "*/30 * * * *" \
-    --command "python3 $HOME/.hermes/scripts/dream_scheduler.py"
-
-hermes cron list 2>/dev/null | grep -q "session-indexer" || \
-    hermes cron create --name "session-indexer" \
-    --schedule "0 */6 * * *" \
-    --command "python3 $HOME/.hermes/scripts/session_indexer.py"
-
-# Env vars
-grep -q "DREAM_AUTO_ENABLED" "$HOME/.bashrc" 2>/dev/null || \
-    printf '\n# Dream Auto v3\nexport DREAM_AUTO_ENABLED=1\nexport DREAM_AUTO_VERBOSE=0\nexport DREAM_AUTO_MAX_INJECT=3\n' >> "$HOME/.bashrc"
-
-echo "Done. Run: python3 $HOME/.hermes/scripts/session_indexer.py --limit 50"
 ```
 
 ---
 
-## Step-by-Step Breakdown
-
-If you are running this manually or need to debug a specific step, here is what each part does.
-
----
-
-### STEP 1: Check Prerequisites
+### STEP 3 — Install Python Dependencies
 
 ```bash
-python3 --version    # Must be 3.10+
-hermes --version     # Must respond
-pip3 --version       # Must respond
-```
-
-If Hermes gateway is not running:
-
-```bash
-hermes gateway status
-# If down:
-hermes gateway install
-hermes gateway start
-```
-
----
-
-### STEP 2: Clone or Update the Repo
-
-**First time:**
-
-```bash
-cd ~
-git clone https://github.com/StefanIsMe/dream-auto.git
-cd dream-auto
-```
-
-**Already installed — to upgrade:**
-
-```bash
-cd ~/dream-auto
-git pull
-```
-
----
-
-### STEP 3: Install Python Dependencies
-
-```bash
-pip3 install --user -r requirements.txt
+pip3 install --user -r "$DREAM_AUTO_REPO/requirements.txt"
 ```
 
 If `psutil` fails to compile, install Python dev headers first:
@@ -222,53 +47,38 @@ If `psutil` fails to compile, install Python dev headers first:
 
 ---
 
-### STEP 4: Copy Files
-
-**First time:**
+### STEP 4 — Copy All Files to Hermes
 
 ```bash
-# Plugin
-cp -r ~/dream-auto/plugins/dream_auto ~/.hermes/plugins/
+# Remove old versions first (ensures deleted files are gone)
+rm -rf "$HERMES_HOME/plugins/dream_auto"
+rm -rf "$HERMES_HOME/skills/autonomous-ai-agents/hermes-dream-task"
+rm -rf "$HERMES_HOME/skills/ops/dream-system-v3"
 
-# Scripts
-cp ~/dream-auto/scripts/dream_scheduler.py ~/.hermes/scripts/
-cp ~/dream-auto/scripts/dream_insights_dashboard.py ~/.hermes/scripts/
-cp ~/dream-auto/scripts/session_indexer.py ~/.hermes/scripts/
-cp ~/dream-auto/scripts/session_grader.py ~/.hermes/scripts/
+# Copy plugin
+cp -r "$DREAM_AUTO_REPO/plugins/dream_auto" "$HERMES_HOME/plugins/"
 
-# Skills
-cp -r ~/dream-auto/skills/autonomous-ai-agents/hermes-dream-task \
-    ~/.hermes/skills/autonomous-ai-agents/
-cp -r ~/dream-auto/skills/ops/dream-system-v3 \
-    ~/.hermes/skills/ops/
-```
+# Copy all scripts
+cp "$DREAM_AUTO_REPO/scripts/dream_scheduler.py" "$HERMES_HOME/scripts/"
+cp "$DREAM_AUTO_REPO/scripts/dream_insights_dashboard.py" "$HERMES_HOME/scripts/"
+cp "$DREAM_AUTO_REPO/scripts/session_indexer.py" "$HERMES_HOME/scripts/"
+cp "$DREAM_AUTO_REPO/scripts/session_grader.py" "$HERMES_HOME/scripts/"
 
-**Upgrading — overwrite everything:**
-
-```bash
-# Remove old versions first, then copy (ensures deleted files are gone)
-rm -rf ~/.hermes/plugins/dream_auto
-rm -rf ~/.hermes/skills/autonomous-ai-agents/hermes-dream-task
-rm -rf ~/.hermes/skills/ops/dream-system-v3
-
-# Copy fresh
-cp -r ~/dream-auto/plugins/dream_auto ~/.hermes/plugins/
-cp ~/dream-auto/scripts/*.py ~/.hermes/scripts/
-cp -r ~/dream-auto/skills/autonomous-ai-agents/hermes-dream-task \
-    ~/.hermes/skills/autonomous-ai-agents/
-cp -r ~/dream-auto/skills/ops/dream-system-v3 \
-    ~/.hermes/skills/ops/
+# Copy skills
+cp -r "$DREAM_AUTO_REPO/skills/autonomous-ai-agents/hermes-dream-task" \
+    "$HERMES_HOME/skills/autonomous-ai-agents/"
+cp -r "$DREAM_AUTO_REPO/skills/ops/dream-system-v3" \
+    "$HERMES_HOME/skills/ops/"
 ```
 
 ---
 
-### STEP 5: Initialize Databases
-
-Safe to run on existing databases — adds v3 indexes and creates `knowledge_cache.db` if missing. Existing data is preserved.
+### STEP 5 — Initialize Databases
 
 ```bash
 python3 - <<'PYEOF'
 import sqlite3, os
+
 STATE = os.path.expanduser("~/.hermes/state/dream")
 os.makedirs(STATE, exist_ok=True)
 os.makedirs(os.path.join(STATE, "logs"), exist_ok=True)
@@ -312,14 +122,19 @@ DB_SCHEMAS = {
     },
     "knowledge_cache.db": {
         "tables": """
-            CREATE TABLE IF NOT EXISTS knowledge_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, content TEXT,
-                source TEXT, cached_at TEXT, content_hash TEXT UNIQUE
+            CREATE TABLE IF NOT EXISTS dream_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT,
+                content TEXT,
+                source TEXT,
+                content_hash TEXT UNIQUE,
+                cached_at TEXT,
+                injected_sessions TEXT DEFAULT '[]'
             );
         """,
         "indexes": [
-            "CREATE INDEX IF NOT EXISTS idx_topic_cached ON knowledge_cache(topic, cached_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_cached       ON knowledge_cache(cached_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_dream_cache_topic     ON dream_cache(topic, cached_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_dream_cache_cached    ON dream_cache(cached_at DESC)",
         ],
     },
 }
@@ -333,61 +148,68 @@ for db_name, schema in DB_SCHEMAS.items():
     conn.commit()
     conn.close()
     print(f"OK: {db_name}")
+
+# Migrate dream_queue.db schema if it already exists (v3.0.0 had a different schema)
+DQ_PATH = os.path.join(STATE, "dream_queue.db")
+conn = sqlite3.connect(DQ_PATH)
+try:
+    conn.execute("ALTER TABLE dream_queue ADD COLUMN IF NOT EXISTS dream_question TEXT")
+except Exception:
+    pass
+try:
+    conn.execute("ALTER TABLE dream_queue ADD COLUMN IF NOT EXISTS resource_cost INTEGER DEFAULT 1")
+except Exception:
+    pass
+conn.commit()
+conn.close()
+print("OK: dream_queue.db migrated if needed")
 PYEOF
 ```
 
 ---
 
-### STEP 6: Dashboard Wrapper
+### STEP 6 — Dashboard Wrapper
 
 ```bash
-mkdir -p ~/.local/bin
-cat > ~/.local/bin/dream-dashboard <<'WRAPPER'
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/dream-dashboard" <<'WRAPPER'
 #!/usr/bin/env bash
 exec python3 "$HOME/.hermes/scripts/dream_insights_dashboard.py" "$@"
 WRAPPER
-chmod +x ~/.local/bin/dream-dashboard
-```
-
-Ensure `~/.local/bin` is in your PATH. If `dream-dashboard` command is not found after this, use the full path:
-
-```bash
-python3 ~/.hermes/scripts/dream_insights_dashboard.py
+chmod +x "$HOME/.local/bin/dream-dashboard"
 ```
 
 ---
 
-### STEP 7: Register Cron Jobs
+### STEP 7 — Register Cron Jobs
 
 ```bash
+# dream-scheduler: every 30 minutes — picks highest-priority queued dream and starts it
 hermes cron create \
-  --name "dream-scheduler" \
-  --schedule "*/30 * * * *" \
-  --command "python3 $HOME/.hermes/scripts/dream_scheduler.py"
+    --name "dream-scheduler" \
+    --schedule "*/30 * * * *" \
+    --command "python3 $HOME/.hermes/scripts/dream_scheduler.py" \
+    2>/dev/null || echo "dream-scheduler cron already registered (skipping)"
 
+# session-indexer: every 6 hours — scans sessions, grades them for dream potential
 hermes cron create \
-  --name "session-indexer" \
-  --schedule "0 */6 * * *" \
-  --command "python3 $HOME/.hermes/scripts/session_indexer.py"
+    --name "session-indexer" \
+    --schedule "0 */6 * * *" \
+    --command "python3 $HOME/.hermes/scripts/session_indexer.py" \
+    2>/dev/null || echo "session-indexer cron already registered (skipping)"
 ```
-
-If a job with that name already exists, the cron system will reject the create — this is fine, skip it.
 
 ---
 
-### STEP 8: Environment Variables
-
-Add to `~/.bashrc` (or `~/.zshrc`):
+### STEP 8 — Environment Variables
 
 ```bash
-export DREAM_AUTO_ENABLED=1
-export DREAM_AUTO_VERBOSE=0
-export DREAM_AUTO_MAX_INJECT=3
-```
-
-Reload in current session:
-
-```bash
+if ! grep -q "DREAM_AUTO_ENABLED" "$HOME/.bashrc" 2>/dev/null; then
+    printf '\n# Dream Auto v3\n' >> "$HOME/.bashrc"
+    printf 'export DREAM_AUTO_ENABLED=1\n' >> "$HOME/.bashrc"
+    printf 'export DREAM_AUTO_VERBOSE=0\n' >> "$HOME/.bashrc"
+    printf 'export DREAM_AUTO_MAX_INJECT=3\n' >> "$HOME/.bashrc"
+fi
 export DREAM_AUTO_ENABLED=1
 export DREAM_AUTO_VERBOSE=0
 export DREAM_AUTO_MAX_INJECT=3
@@ -395,138 +217,72 @@ export DREAM_AUTO_MAX_INJECT=3
 
 ---
 
-### STEP 9: Initial Session Index
+### STEP 9 — First Run: Populate Session Index
 
 ```bash
-python3 ~/.hermes/scripts/session_indexer.py --limit 50
+python3 "$HOME/.hermes/scripts/session_indexer.py" --limit 50
 ```
-
-This scans your recent sessions and grades them for dream potential. Run once after install to populate the database.
 
 ---
 
-### STEP 10: Verify
+### STEP 10 — Verify
 
 ```bash
-# Plugin files
-ls ~/.hermes/plugins/dream_auto/__init__.py
-ls ~/.hermes/plugins/dream_auto/resource_monitor.py
-ls ~/.hermes/plugins/dream_auto/plugin.yaml
+echo "=== Plugin files ==="
+ls "$HERMES_HOME/plugins/dream_auto/__init__.py"
+ls "$HERMES_HOME/plugins/dream_auto/plugin.yaml"
+ls "$HERMES_HOME/plugins/dream_auto/resource_monitor.py"
 
-# Scripts
-ls ~/.hermes/scripts/dream_scheduler.py
-ls ~/.hermes/scripts/dream_insights_dashboard.py
-ls ~/.hermes/scripts/session_indexer.py
-ls ~/.hermes/scripts/session_grader.py
+echo "=== Scripts ==="
+ls "$HERMES_HOME/scripts/dream_scheduler.py"
+ls "$HERMES_HOME/scripts/dream_insights_dashboard.py"
+ls "$HERMES_HOME/scripts/session_indexer.py"
+ls "$HERMES_HOME/scripts/session_grader.py"
 
-# Skills
-ls ~/.hermes/skills/autonomous-ai-agents/hermes-dream-task/scripts/dream_loop_v3.py
-ls ~/.hermes/skills/autonomous-ai-agents/hermes-dream-task/scripts/fast_path.py
-ls ~/.hermes/skills/ops/dream-system-v3/SKILL.md
+echo "=== Skills ==="
+ls "$HERMES_HOME/skills/autonomous-ai-agents/hermes-dream-task/scripts/dream_loop_v3.py"
+ls "$HERMES_HOME/skills/ops/dream-system-v3/SKILL.md"
 
-# Databases (all 3 should exist)
-ls ~/.hermes/state/dream/session_index.db
-ls ~/.hermes/state/dream/dream_queue.db
-ls ~/.hermes/state/dream/knowledge_cache.db
+echo "=== Databases ==="
+ls "$HERMES_HOME/state/dream/session_index.db"
+ls "$HERMES_HOME/state/dream/dream_queue.db"
+ls "$HERMES_HOME/state/dream/knowledge_cache.db"
 
-# Dashboard
-dream-dashboard --dry-run 2>/dev/null || python3 ~/.hermes/scripts/dream_insights_dashboard.py --dry-run
+echo "=== Dashboard ==="
+python3 "$HERMES_HOME/scripts/dream_insights_dashboard.py" --dry-run 2>/dev/null && echo "dashboard: OK" || echo "dashboard: FAILED"
 
-# Cron jobs
-hermes cron list
+echo "=== Cron jobs ==="
+hermes cron list 2>/dev/null | grep -E "dream-scheduler|session-indexer"
 ```
 
-All should respond without error.
+If all paths respond without error, Dream Auto is installed.
 
 ---
 
-## Upgrading from Any Version (Including v3.0.x → Latest)
+## What to Do After Install
 
-If Dream Auto is already installed, running the All-in-One command (or re-running Steps 4 and 5) upgrades cleanly:
-
-```bash
-cd ~/dream-auto
-git pull
-
-# Re-copy all files (Step 4 in full below)
-rm -rf ~/.hermes/plugins/dream_auto
-rm -rf ~/.hermes/skills/autonomous-ai-agents/hermes-dream-task
-rm -rf ~/.hermes/skills/ops/dream-system-v3
-cp -r ~/dream-auto/plugins/dream_auto ~/.hermes/plugins/
-cp ~/dream-auto/scripts/*.py ~/.hermes/scripts/
-cp -r ~/dream-auto/skills/autonomous-ai-agents/hermes-dream-task ~/.hermes/skills/autonomous-ai-agents/
-cp -r ~/dream-auto/skills/ops/dream-system-v3 ~/.hermes/skills/ops/
-
-# Step 5 — DB init (safe to re-run on existing DBs)
-# No data loss, no re-clone
-```
-
-After upgrading, run the scheduler once manually to apply the completion-detection fix:
+**Trigger a manual scheduler run** (syncs any completed dreams stuck in "running" state):
 
 ```bash
 python3 ~/.hermes/scripts/dream_scheduler.py
 ```
 
----
-
-## Upgrading from v1 or v2
+**Check the dashboard:**
 
 ```bash
-cd ~/dream-auto
-git pull
+dream-dashboard              # full overview
+dream-dashboard --insights  # recent insights only
+dream-dashboard --queue     # queue only
+dream-dashboard --errors    # error breakdown
 ```
 
-Then re-run Steps 4 and 5 from above:
+**Restart Hermes gateway if cron jobs are not firing:**
 
 ```bash
-# Step 4 — overwrite all files
-rm -rf ~/.hermes/plugins/dream_auto
-rm -rf ~/.hermes/skills/autonomous-ai-agents/hermes-dream-task
-rm -rf ~/.hermes/skills/ops/dream-system-v3
-cp -r ~/dream-auto/plugins/dream_auto ~/.hermes/plugins/
-cp ~/dream-auto/scripts/*.py ~/.hermes/scripts/
-cp -r ~/dream-auto/skills/autonomous-ai-agents/hermes-dream-task ~/.hermes/skills/autonomous-ai-agents/
-cp -r ~/dream-auto/skills/ops/dream-system-v3 ~/.hermes/skills/ops/
-
-# Step 5 — run the DB init Python script (Step 5 above)
-# This adds v3 indexes to your existing DBs and creates knowledge_cache.db.
-# It does NOT touch your existing session data or pending dreams.
-
-# Step 9 — re-index sessions with v3 grading
-python3 ~/.hermes/scripts/session_indexer.py --limit 50
+hermes gateway status
+# If down:
+hermes gateway install && hermes gateway start
 ```
-
-Pending dreams from v1/v2 survive the upgrade. The scheduler handles them normally.
-
----
-
-## Upgrading from v3.0.0 → v3.0.1
-
-v3.0.1 is a pure bug-fix release. No schema changes, no file deletions, no data loss.
-
-```bash
-cd ~/dream-auto
-git pull
-
-# Re-copy the fixed files (all changes are in scripts/ and skills/)
-cp ~/dream-auto/scripts/dream_scheduler.py ~/.hermes/scripts/
-cp ~/dream-auto/skills/autonomous-ai-agents/hermes-dream-task/scripts/dream_loop_v3.py \
-    ~/.hermes/skills/autonomous-ai-agents/hermes-dream-task/scripts/
-
-# Trigger a manual scheduler run to sync the completion-detection fix
-# This promotes any dreams that completed under v3.0.0 but are still stuck "running" in the queue DB
-python3 ~/.hermes/scripts/dream_scheduler.py
-```
-
-After the manual run, `dream_queue.db` will be corrected and the scheduler will continue normally.
-
-What changed in v3.0.1:
-- **dream_scheduler.py**: `sync_dream_status()` replaces `kill_stale_dreams()` — now detects normally completed dreams and syncs the queue DB. Previously only wallclock-killed dreams were synced, so completed dreams stayed "running" in the queue forever, blocking concurrency slots.
-- **dream_scheduler.py**: LLM-based concurrency and sleep decisions replaced with rule-based heuristics (eliminates LLM timeout hangs from non-TTY subprocess context).
-- **dream_loop_v3.py**: 5 bug fixes — `executor` undefined reference, `run_results` undefined, `planned_action` ordering, CI-width guard `n>2`, `ThreadPoolExecutor` lifecycle fix.
-- **dream_scheduler.py**: `ATTACH DATABASE` fix for cross-DB join in `get_session_with_highest_potential()`.
-
-All databases are fully compatible — no migration needed.
 
 ---
 
@@ -534,20 +290,20 @@ All databases are fully compatible — no migration needed.
 
 ```
 dream-auto/
-├── SETUP.md               # This file — full install/upgrade guide
+├── SETUP.md               # This file — agent-executable install/upgrade guide
 ├── README.md              # Human-readable overview
 ├── requirements.txt       # psutil, rich
 ├── plugins/
-│   └── dream_auto/        # __init__.py, resource_monitor.py, plugin.yaml
+│   └── dream_auto/       # __init__.py, resource_monitor.py, plugin.yaml
 ├── scripts/
-│   ├── dream_scheduler.py         # Queue manager + wallclock killer
+│   ├── dream_scheduler.py         # Queue manager + wallclock killer + knowledge cache sync
 │   ├── dream_insights_dashboard.py # CLI dashboard
 │   ├── session_indexer.py          # Session scanner + grader
 │   └── session_grader.py           # LLM-based potential scorer
 └── skills/
     ├── autonomous-ai-agents/hermes-dream-task/
     │   ├── scripts/dream_loop_v3.py  # MCTS engine v3
-    │   ├── scripts/fast_path.py       # Fast-path分流 heuristic
+    │   ├── scripts/fast_path.py       # Heuristic分流
     │   └── SKILL.md
     └── ops/dream-system-v3/
         └── SKILL.md
@@ -558,24 +314,23 @@ dream-auto/
 ## Troubleshooting
 
 | Symptom | Fix |
-|---|---|
-| `hermes: command not found` | Install Hermes Agent first. Stop here. |
-| `pip3: command not found` | Install Python pip first. Stop here. |
+|---------|-----|
+| `hermes: command not found` | Add Hermes to PATH before installing |
+| `pip3: command not found` | Install Python pip first |
 | `psutil` install fails | `sudo dnf install python3-devel` (Fedora) or `sudo apt install python3-dev` (Debian/Ubuntu) or `xcode-select --install` (macOS) |
-| `dream-dashboard` not found | `~/.local/bin` not in your PATH. Use `python3 ~/.hermes/scripts/dream_insights_dashboard.py` instead. |
-| Queue shows dreams stuck "running" after completion | The scheduler's `sync_dream_status()` (v3.0.1+) syncs completed dreams from meta.json to the queue DB. Run `python3 ~/.hermes/scripts/dream_scheduler.py` once manually to trigger the sync. |
-| Cron jobs fail to register | Run `hermes gateway start` first. |
-| Dashboard shows no sessions | Run `python3 ~/.hermes/scripts/session_indexer.py --limit 50` manually. |
-| Dreams never start | Check resources: `python3 ~/.hermes/plugins/dream_auto/resource_monitor.py` |
-| Upgrade: old files persist | Make sure to `rm -rf` the old directories before copying (Step 4 upgrade instructions). |
-| DB errors after upgrade | Run Step 5 again. `CREATE INDEX IF NOT EXISTS` is safe to re-run on any existing DB. |
-| knowledge_cache.db missing | Run Step 5. It creates the table and indexes even on an existing partial install. |
+| `dream-dashboard` not found | `~/.local/bin` not in PATH. Use `python3 ~/.hermes/scripts/dream_insights_dashboard.py` instead |
+| Cron jobs not firing | Run `hermes gateway start` |
+| Dashboard shows no sessions | Run `python3 ~/.hermes/scripts/session_indexer.py --limit 50` manually |
+| Dreams never start | Check `~/.hermes/plugins/dream_auto/resource_monitor.py` for CPU/RAM availability |
+| Queue shows dreams stuck "running" | Run `python3 ~/.hermes/scripts/dream_scheduler.py` once manually — the completion-detection fix (v3.0.1) syncs them |
+| Upgrade: old files persist | Run Step 4 again — the `rm -rf` before each `cp` ensures clean overwrite |
+| DB errors after upgrade | Run Step 5 again — `CREATE INDEX IF NOT EXISTS` and `CREATE TABLE IF NOT EXISTS` are safe to re-run |
 
 ---
 
-## Platform Notes
+## Version History
 
-- **Linux:** Full support. Uses `hermes cron` (systemd user service).
-- **macOS:** Full support. Uses `hermes cron` (launchd).
-- **Windows WSL:** Full support inside WSL. Install Hermes inside WSL.
-- **Windows Native:** Not supported. Use WSL2.
+| Version | What changed |
+|---------|-------------|
+| 3.0.1   | **Bug fixes**: completion detection (queue DB now synced when dreams finish normally), LLM timeout bug fixed (rule-based scheduler), 5 engine bugs in dream_loop_v3.py, ATTACH DATABASE fix. No DB schema changes. |
+| 3.0.0   | Initial v3 release — MCTS engine, parallel rollouts, UCB1-Tuned, CI-width bonus, wallclock killer, SQLite indexes, knowledge cache |

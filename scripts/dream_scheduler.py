@@ -160,6 +160,111 @@ def get_top_queued(limit: int = 1) -> list[dict]:
     ]
 
 
+def _sync_dream_to_knowledge_cache(dream_id: str):
+    """
+    After a dream completes, extract insights and write them to knowledge_cache.db.
+    This makes dream learnings searchable by topic when similar issues come up.
+    """
+    import hashlib
+
+    KNOWLEDGE_CACHE_DB = DREAM_DIR / "knowledge_cache.db"
+    dp = DREAM_DIR / dream_id
+    insights_file = dp / "insights.json"
+    questions_file = dp / "pending_questions.json"
+    meta_file = dp / "meta.json"
+
+    if not insights_file.exists():
+        return
+
+    try:
+        insights = json.loads(insights_file.read_text())
+        questions = json.loads(questions_file.read_text()) if questions_file.exists() else []
+        meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        return
+
+    if not insights:
+        return
+
+    # Extract topic from the dream's actual question (queue DB has the full brief text)
+    conn_q = sqlite3.connect(str(DREAM_QUEUE_DB))
+    try:
+        row = conn_q.execute(
+            "SELECT dream_question FROM dream_queue WHERE dream_id=?",
+            (dream_id,)
+        ).fetchone()
+        dream_question = row[0] if row else ""
+    finally:
+        conn_q.close()
+
+    # Use session indexer's topics field — already computed per-user, not hardcoded
+    topic = _extract_topic_from_session(dream_id)
+
+    # Build content: insights + pending questions (if any actionable)
+    content_parts = []
+    for insight in insights:
+        content_parts.append(f"insight: {insight}")
+    for q in questions[:2]:
+        content_parts.append(f"open_question: {q}")
+
+    content = "\n".join(content_parts)
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+
+    # Only write if this exact content isn't already cached (avoid duplicates on re-runs)
+    conn = sqlite3.connect(str(KNOWLEDGE_CACHE_DB))
+    try:
+        existing = conn.execute(
+            "SELECT id FROM knowledge_cache WHERE content_hash=?",
+            (content_hash,)
+        ).fetchone()
+        if existing:
+            conn.close()
+            return
+
+        now = datetime.now(GMT7).isoformat()
+        conn.execute("""
+            INSERT INTO knowledge_cache (topic, content, content_hash, source, cached_at, injected_sessions)
+            VALUES (?, ?, ?, ?, ?, '[]')
+        """, (topic, content, content_hash, f"dream:{dream_id}", now))
+        conn.commit()
+        print(f"  [KNOWLEDGE CACHE] {dream_id} → topic={topic}, {len(insights)} insight(s) cached")
+    except Exception as e:
+        print(f"  [KNOWLEDGE CACHE ERROR] {dream_id}: {e}")
+    finally:
+        conn.close()
+
+
+def _extract_topic_from_session(dream_id: str) -> str:
+    """
+    Extract topic from the session's topics field in session_index.db.
+    The session indexer already computed this per-user — use it directly.
+    Returns first topic or 'general' if none.
+    """
+    try:
+        # Get session_id from dream_queue.db, then look up topics in session_index.db
+        conn_q = sqlite3.connect(str(DREAM_QUEUE_DB))
+        row = conn_q.execute(
+            "SELECT session_id FROM dream_queue WHERE dream_id=?", (dream_id,)
+        ).fetchone()
+        conn_q.close()
+        if not row or not row[0]:
+            return "general"
+        session_id = row[0]
+
+        conn_s = sqlite3.connect(str(DB_PATH))
+        row2 = conn_s.execute(
+            "SELECT topics FROM sessions WHERE session_id=?", (session_id,)
+        ).fetchone()
+        conn_s.close()
+        if row2 and row2[0]:
+            topics = json.loads(row2[0])
+            if topics:
+                return topics[0]
+    except Exception:
+        pass
+    return "general"
+
+
 def _sync_queue_status(dream_id: str, status: str):
     """Update dream_queue status if the dream has finished but queue DB doesn't know yet."""
     try:
@@ -176,6 +281,10 @@ def _sync_queue_status(dream_id: str, status: str):
         conn.close()
     except Exception as e:
         print(f"  [SYNC ERROR] {dream_id}: {e}")
+
+    # When a dream completes, push its insights into the predictive knowledge cache
+    if status == "completed":
+        _sync_dream_to_knowledge_cache(dream_id)
 
 
 def mark_started(dream_id: str):
