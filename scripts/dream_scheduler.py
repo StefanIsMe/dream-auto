@@ -60,10 +60,19 @@ DREAM_WALLCLOCK_SECONDS = MAX_DREAM_WALLCLOCK_MINUTES * 60
 
 # ── Stale dream killer ─────────────────────────────────────────────────────────
 
-def kill_stale_dreams() -> list[dict]:
+def sync_dream_status() -> list[dict]:
     """
-    Ralph-loop wallclock enforcer: kill any dream running longer than MAX_DREAM_WALLCLOCK_MINUTES.
-    Called at the start of each scheduler cycle. Returns list of killed dream info.
+    Ralph-loop status synchroniser: two jobs in one pass over DREAM_DIR.
+
+    1. Wallclock enforcer — any dream running longer than MAX_DREAM_WALLCLOCK_MINUTES
+       is marked killed_wallclock in both status.txt/meta.json and the queue DB.
+
+    2. Completion detector — any dream whose meta.json shows status=done/completed
+       but whose queue DB entry is still "running" is updated to "completed" in the
+       queue DB.  This is the code path that drains the queue when dreams finish
+       normally (i.e. not wallclock-killed).
+
+    Returns list of killed dream info (empty list if none).
     """
     if not DREAM_DIR.exists():
         return []
@@ -85,39 +94,41 @@ def kill_stale_dreams() -> list[dict]:
         except (json.JSONDecodeError, OSError):
             continue
 
-        # Only kill if status is running
-        status = meta.get("status", "")
-        if status != "running":
-            continue
+        dream_id = meta.get("dream_id", d.name)
+        meta_status = meta.get("status", "")
 
-        started_at = meta.get("started_at")
-        if started_at is None:
-            continue
+        # ── Case 1: normally completed ────────────────────────────────────────
+        if meta_status in ("done", "completed"):
+            # Queue DB may still say "running" — promote it to "completed"
+            _sync_queue_status(dream_id, "completed")
 
-        elapsed = now - started_at
-        if elapsed > DREAM_WALLCLOCK_SECONDS:
-            dream_id = meta.get("dream_id", d.name)
-            wallclock_min = elapsed / 60
-            print(f"  [WALLCLOCK KILL] {dream_id} ran for {wallclock_min:.0f}min > {MAX_DREAM_WALLCLOCK_MINUTES}min — killing")
+        # ── Case 2: wallclock exceeded ─────────────────────────────────────────
+        if meta_status == "running":
+            started_at = meta.get("started_at")
+            if started_at is not None:
+                elapsed = now - started_at
+                if elapsed > DREAM_WALLCLOCK_SECONDS:
+                    wallclock_min = elapsed / 60
+                    print(f"  [WALLCLOCK KILL] {dream_id} ran for {wallclock_min:.0f}min > {MAX_DREAM_WALLCLOCK_MINUTES}min — killing")
 
-            # Mark as killed in status
-            (status_file).write_text("killed_wallclock")
-            meta["status"] = "killed_wallclock"
-            meta["killed_at"] = now
-            meta["wallclock_minutes"] = round(wallclock_min, 1)
-            try:
-                write_json(meta_file, meta)
-            except Exception:
-                pass
+                    # Mark as killed in status
+                    (status_file).write_text("killed_wallclock")
+                    meta["status"] = "killed_wallclock"
+                    meta["killed_at"] = now
+                    meta["wallclock_minutes"] = round(wallclock_min, 1)
+                    try:
+                        write_json(meta_file, meta)
+                    except Exception:
+                        pass
 
-            # Also mark queue entry complete so it doesn't retry
-            mark_completed(dream_id, killed=True)
+                    # Mark queue entry complete so it doesn't retry
+                    mark_completed(dream_id, killed=True)
 
-            killed.append({
-                "dream_id": dream_id,
-                "wallclock_min": round(wallclock_min, 1),
-                "reason": f"exceeded {MAX_DREAM_WALLCLOCK_MINUTES}min wallclock"
-            })
+                    killed.append({
+                        "dream_id": dream_id,
+                        "wallclock_min": round(wallclock_min, 1),
+                        "reason": f"exceeded {MAX_DREAM_WALLCLOCK_MINUTES}min wallclock"
+                    })
 
     return killed
 
@@ -147,6 +158,24 @@ def get_top_queued(limit: int = 1) -> list[dict]:
          "question": r[3], "grade": r[4], "priority": r[5], "status": r[6]}
         for r in rows
     ]
+
+
+def _sync_queue_status(dream_id: str, status: str):
+    """Update dream_queue status if the dream has finished but queue DB doesn't know yet."""
+    try:
+        conn = sqlite3.connect(str(DREAM_QUEUE_DB))
+        cur = conn.execute("SELECT status FROM dream_queue WHERE dream_id=?", (dream_id,))
+        row = cur.fetchone()
+        if row and row[0] in ("queued", "running"):
+            conn.execute(
+                "UPDATE dream_queue SET status=?, completed_at=? WHERE dream_id=?",
+                (status, datetime.now(GMT7).isoformat(), dream_id)
+            )
+            conn.commit()
+            print(f"  [SYNC] {dream_id}: queue '{row[0]}' → '{status}'")
+        conn.close()
+    except Exception as e:
+        print(f"  [SYNC ERROR] {dream_id}: {e}")
 
 
 def mark_started(dream_id: str):
@@ -408,8 +437,8 @@ def run_scheduler_cycle(dry_run: bool = False) -> dict:
     ensure_queue_db()
     results = {"dreams_started": 0, "skipped": [], "errors": [], "wallclock_killed": []}
 
-    # 0. Ralph-loop wallclock enforcer: kill dreams that have been running too long
-    killed = kill_stale_dreams()
+    # 0. Ralph-loop status synchroniser: completion detector + wallclock enforcer
+    killed = sync_dream_status()
     if killed:
         results["wallclock_killed"] = killed
         print(f"[SCHEDULER] Killed {len(killed)} stale dreams")
