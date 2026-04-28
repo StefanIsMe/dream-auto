@@ -784,6 +784,7 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
         # ROLLOUT: run all rollouts in parallel, then backpropagate sequentially
         # (backprop must be sequential to avoid race conditions on shared tree dict)
         rollout_tasks = []
+        rollout_ex = ThreadPoolExecutor(max_workers=ROLLOUTS_PER_NODE)
         for child_id in child_ids:
             child = next((n for n in tree["nodes"] if n["node_id"] == child_id), None)
             if not child:
@@ -794,12 +795,13 @@ def mcts_loop(dream_id: str, brief: str) -> dict:
                 "description": child.get("approach_desc", ""),
             }
             for r in range(ROLLOUTS_PER_NODE):
-                fid = executor.submit(rollout, child_approach, brief, iteration)
+                fid = rollout_ex.submit(rollout, child_approach, brief, iteration)
                 rollout_tasks.append((fid, child_id, child))
 
         # Wait for all rollouts to complete (runs truly in parallel)
-        with ThreadPoolExecutor(max_workers=ROLLOUTS_PER_NODE) as rollout_ex:
-            for fid, child_id, child in rollout_tasks:
+        wait([f for f, _, _ in rollout_tasks], return_when=ALL_COMPLETED)
+        rollout_ex.shutdown(wait=False)
+        for fid, child_id, child in rollout_tasks:
                 try:
                     result = fid.result()
                     outcome = result.get("outcome_float", 0.5)
