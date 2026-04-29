@@ -61,6 +61,13 @@ fi
 "$HERMES_PY" -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
 ```
 
+You do **not** need to activate the virtualenv first when calling the venv's Python directly. `"$HERMES_PY" -m pip ...` installs into that same Hermes virtualenv. If you prefer an interactive shell, this equivalent form also works:
+
+```bash
+source "$HERMES_VENV/bin/activate"
+python -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
+```
+
 If `psutil` fails to compile, install Python dev headers first:
 - Fedora/RHEL: `sudo dnf install python3-devel`
 - Debian/Ubuntu: `sudo apt install python3-dev`
