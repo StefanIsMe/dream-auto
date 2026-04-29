@@ -58,14 +58,23 @@ fi
 ### STEP 3 — Install Python Dependencies
 
 ```bash
-"$HERMES_PY" -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
+if "$HERMES_PY" -m pip --version >/dev/null 2>&1; then
+    "$HERMES_PY" -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
+elif command -v uv >/dev/null 2>&1; then
+    uv pip install --python "$HERMES_PY" -r "$DREAM_AUTO_REPO/requirements.txt"
+else
+    "$HERMES_PY" -m ensurepip --upgrade
+    "$HERMES_PY" -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
+fi
 ```
 
-You do **not** need to activate the virtualenv first when calling the venv's Python directly. `"$HERMES_PY" -m pip ...` installs into that same Hermes virtualenv. If you prefer an interactive shell, this equivalent form also works:
+You do **not** need to activate the virtualenv first when calling the venv's Python directly. `"$HERMES_PY" -m pip ...` installs into that same Hermes virtualenv. If the venv does not have `pip` but `uv` is installed, `uv pip install --python "$HERMES_PY" ...` installs into the same Hermes venv. If you prefer an interactive shell, this equivalent form also works:
 
 ```bash
 source "$HERMES_VENV/bin/activate"
 python -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
+# Or, with uv:
+uv pip install -r "$DREAM_AUTO_REPO/requirements.txt"
 ```
 
 If `psutil` fails to compile, install Python dev headers first:
@@ -346,6 +355,8 @@ dream-auto/
 |---------|-----|
 | Hermes venv not found | Set `HERMES_VENV`, `HERMES_PY`, or reinstall Hermes before continuing |
 | `hermes: command not found` | Set `HERMES_BIN` or add Hermes to PATH before installing |
+| `pip` missing from Hermes venv | Install `uv` and rerun Step 3, or let Step 3 try `ensurepip` automatically |
+| `uv: command not found` | Install uv from https://docs.astral.sh/uv/ or ensure the Hermes venv has pip |
 | `psutil` install fails | `sudo dnf install python3-devel` (Fedora) or `sudo apt install python3-dev` (Debian/Ubuntu) or `xcode-select --install` (macOS) |
 | `dream-dashboard` not found | `~/.local/bin` not in PATH. Use `$HERMES_PY ~/.hermes/scripts/dream_insights_dashboard.py` instead |
 | Cron jobs not firing | Run `$HERMES_BIN gateway start` |
