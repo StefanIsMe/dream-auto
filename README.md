@@ -74,7 +74,7 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
 |---|---|---|
 | Python 3.10+ | `python3 --version` | Required |
 | Hermes Agent CLI | `hermes --version` | Must be installed and in PATH |
-| pip | `pip3 --version` | For `psutil` and `rich` |
+| pip | `$HERMES_VENV/bin/python -m pip --version` | Installs into Hermes venv (via `uv pip` fallback) |
 | Linux / macOS / WSL | `uname -a` | Native Windows not supported |
 
 Hermes gateway must be running for cron jobs to work:
@@ -135,13 +135,13 @@ dream-dashboard --dry-run   # test without running
 ### Manual Scheduler Check
 
 ```bash
-python3 ~/.hermes/scripts/dream_scheduler.py --dry-run
+$HERMES_PY ~/.hermes/scripts/dream_scheduler.py --dry-run
 ```
 
 ### Manual Session Index
 
 ```bash
-python3 ~/.hermes/scripts/session_indexer.py --limit 50
+$HERMES_PY ~/.hermes/scripts/session_indexer.py --limit 50
 ```
 
 ---
@@ -198,9 +198,9 @@ You don't interact with it. It just makes Hermes smarter over time.
 | `psutil` install fails | `sudo apt install python3-dev` (Linux) or `xcode-select --install` (macOS) |
 | Cron jobs not running | `hermes gateway status` → if down, `hermes gateway start` |
 | Dashboard shows empty | Run `session_indexer.py` manually once to populate DB |
-| Dreams never start | Check resources: `python3 ~/.hermes/plugins/dream_auto/resource_monitor.py` |
+| Dreams never start | Check resources: `$HERMES_PY ~/.hermes/plugins/dream_auto/resource_monitor.py` |
 | Plugin not loading | Verify `DREAM_AUTO_ENABLED=1` and restart Hermes |
-| Session index empty after install | Run `python3 ~/.hermes/scripts/session_indexer.py --limit 50` manually |
+| Session index empty after install | Run `$HERMES_PY ~/.hermes/scripts/session_indexer.py --limit 50` manually |
 
 ---
 
