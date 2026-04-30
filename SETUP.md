@@ -18,6 +18,28 @@ If Dream Auto is already installed, running these steps upgrades it. If it is no
 HERMES_HOME="$HOME/.hermes"
 DREAM_AUTO_REPO="$HOME/dream-auto"
 STATE_DIR="$HERMES_HOME/state/dream"
+
+# Use the Python and Hermes CLI from the Hermes Agent virtual environment.
+# This keeps Dream Auto dependencies visible to Hermes plugins, cron jobs, and scripts.
+HERMES_VENV="${HERMES_VENV:-$HERMES_HOME/hermes-agent/venv}"
+HERMES_PY="${HERMES_PY:-$HERMES_VENV/bin/python}"
+HERMES_BIN="${HERMES_BIN:-$HERMES_VENV/bin/hermes}"
+
+if [ ! -x "$HERMES_PY" ]; then
+    echo "ERROR: Hermes Python not found at $HERMES_PY"
+    echo "Set HERMES_VENV or HERMES_PY to your Hermes virtualenv before continuing."
+    exit 1
+fi
+
+if [ ! -x "$HERMES_BIN" ]; then
+    HERMES_BIN="$(command -v hermes || true)"
+fi
+
+if [ -z "$HERMES_BIN" ] || [ ! -x "$HERMES_BIN" ]; then
+    echo "ERROR: Hermes CLI not found. Make sure Hermes Agent is installed and in your PATH."
+    echo "If Hermes is installed in a custom location, set HERMES_BIN to the hermes binary path."
+    exit 1
+fi
 ```
 
 ---
@@ -37,7 +59,25 @@ fi
 ### STEP 3 — Install Python Dependencies
 
 ```bash
-pip3 install --user -r "$DREAM_AUTO_REPO/requirements.txt"
+if "$HERMES_PY" -m pip --version >/dev/null 2>&1; then
+    "$HERMES_PY" -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
+elif command -v uv >/dev/null 2>&1; then
+    uv pip install --python "$HERMES_PY" -r "$DREAM_AUTO_REPO/requirements.txt"
+else
+    "$HERMES_PY" -m ensurepip --upgrade
+    "$HERMES_PY" -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
+fi
+
+"$HERMES_PY" -c "import psutil, rich" 2>/dev/null || echo "WARNING: psutil or rich not importable — check Step 3"
+```
+
+You do **not** need to activate the virtualenv first when calling the venv's Python directly. `"$HERMES_PY" -m pip ...` installs into that same Hermes virtualenv. If the venv does not have `pip` but `uv` is installed, `uv pip install --python "$HERMES_PY" ...` installs into the same Hermes venv. If you prefer an interactive shell, this equivalent form also works:
+
+```bash
+source "$HERMES_VENV/bin/activate"
+python -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
+# Or, with uv:
+uv pip install -r "$DREAM_AUTO_REPO/requirements.txt"
 ```
 
 If `psutil` fails to compile, install Python dev headers first:
@@ -76,7 +116,7 @@ cp -r "$DREAM_AUTO_REPO/skills/ops/dream-system-v3" \
 ### STEP 5 — Initialize Databases
 
 ```bash
-python3 - <<'PYEOF'
+"$HERMES_PY" - <<'PYEOF'
 import sqlite3, os
 
 STATE = os.path.expanduser("~/.hermes/state/dream")
@@ -174,7 +214,10 @@ PYEOF
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/dream-dashboard" <<'WRAPPER'
 #!/usr/bin/env bash
-exec python3 "$HOME/.hermes/scripts/dream_insights_dashboard.py" "$@"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_VENV="${HERMES_VENV:-$HERMES_HOME/hermes-agent/venv}"
+HERMES_PY="${HERMES_PY:-$HERMES_VENV/bin/python}"
+exec "$HERMES_PY" "$HERMES_HOME/scripts/dream_insights_dashboard.py" "$@"
 WRAPPER
 chmod +x "$HOME/.local/bin/dream-dashboard"
 ```
@@ -184,18 +227,19 @@ chmod +x "$HOME/.local/bin/dream-dashboard"
 ### STEP 7 — Register Cron Jobs
 
 ```bash
-# dream-scheduler: every 30 minutes — picks highest-priority queued dream and starts it
-hermes cron create \
+# dream-scheduler: every 30 minutes — picks highest-priority queued dream and starts it.
+# Cron scripts are executed by Hermes with the same Python runtime as Hermes itself.
+"$HERMES_BIN" cron create "*/30 * * * *" \
     --name "dream-scheduler" \
-    --schedule "*/30 * * * *" \
-    --command "python3 $HOME/.hermes/scripts/dream_scheduler.py" \
+    --script "$HERMES_HOME/scripts/dream_scheduler.py" \
+    "Run the Dream Auto scheduler script and report its result briefly." \
     2>/dev/null || echo "dream-scheduler cron already registered (skipping)"
 
-# session-indexer: every 6 hours — scans sessions, grades them for dream potential
-hermes cron create \
+# session-indexer: every 6 hours — scans sessions, grades them for dream potential.
+"$HERMES_BIN" cron create "0 */6 * * *" \
     --name "session-indexer" \
-    --schedule "0 */6 * * *" \
-    --command "python3 $HOME/.hermes/scripts/session_indexer.py" \
+    --script "$HERMES_HOME/scripts/session_indexer.py" \
+    "Run the Dream Auto session indexer script and report its result briefly." \
     2>/dev/null || echo "session-indexer cron already registered (skipping)"
 ```
 
@@ -220,7 +264,7 @@ export DREAM_AUTO_MAX_INJECT=3
 ### STEP 9 — First Run: Populate Session Index
 
 ```bash
-python3 "$HOME/.hermes/scripts/session_indexer.py" --limit 50
+"$HERMES_PY" "$HERMES_HOME/scripts/session_indexer.py" --limit 50
 ```
 
 ---
@@ -249,10 +293,10 @@ ls "$HERMES_HOME/state/dream/dream_queue.db"
 ls "$HERMES_HOME/state/dream/knowledge_cache.db"
 
 echo "=== Dashboard ==="
-python3 "$HERMES_HOME/scripts/dream_insights_dashboard.py" --dry-run 2>/dev/null && echo "dashboard: OK" || echo "dashboard: FAILED"
+"$HERMES_PY" "$HERMES_HOME/scripts/dream_insights_dashboard.py" --dry-run 2>/dev/null && echo "dashboard: OK" || echo "dashboard: FAILED"
 
 echo "=== Cron jobs ==="
-hermes cron list 2>/dev/null | grep -E "dream-scheduler|session-indexer"
+"$HERMES_BIN" cron list 2>/dev/null | grep -E "dream-scheduler|session-indexer"
 ```
 
 If all paths respond without error, Dream Auto is installed.
@@ -264,7 +308,7 @@ If all paths respond without error, Dream Auto is installed.
 **Trigger a manual scheduler run** (syncs any completed dreams stuck in "running" state):
 
 ```bash
-python3 ~/.hermes/scripts/dream_scheduler.py
+"$HERMES_PY" "$HERMES_HOME/scripts/dream_scheduler.py"
 ```
 
 **Check the dashboard:**
@@ -279,9 +323,9 @@ dream-dashboard --errors    # error breakdown
 **Restart Hermes gateway if cron jobs are not firing:**
 
 ```bash
-hermes gateway status
+"$HERMES_BIN" gateway status
 # If down:
-hermes gateway install && hermes gateway start
+"$HERMES_BIN" gateway install && "$HERMES_BIN" gateway start
 ```
 
 ---
@@ -315,14 +359,16 @@ dream-auto/
 
 | Symptom | Fix |
 |---------|-----|
-| `hermes: command not found` | Add Hermes to PATH before installing |
-| `pip3: command not found` | Install Python pip first |
+| Hermes venv not found | Set `HERMES_VENV`, `HERMES_PY`, or reinstall Hermes before continuing |
+| `hermes: command not found` | Set `HERMES_BIN` or add Hermes to PATH before installing |
+| `pip` missing from Hermes venv | Install `uv` and rerun Step 3, or let Step 3 try `ensurepip` automatically |
+| `uv: command not found` | Install uv from https://docs.astral.sh/uv/ or ensure the Hermes venv has pip |
 | `psutil` install fails | `sudo dnf install python3-devel` (Fedora) or `sudo apt install python3-dev` (Debian/Ubuntu) or `xcode-select --install` (macOS) |
-| `dream-dashboard` not found | `~/.local/bin` not in PATH. Use `python3 ~/.hermes/scripts/dream_insights_dashboard.py` instead |
-| Cron jobs not firing | Run `hermes gateway start` |
-| Dashboard shows no sessions | Run `python3 ~/.hermes/scripts/session_indexer.py --limit 50` manually |
+| `dream-dashboard` not found | `~/.local/bin` not in PATH. Use `$HERMES_PY ~/.hermes/scripts/dream_insights_dashboard.py` instead |
+| Cron jobs not firing | Run `$HERMES_BIN gateway start` |
+| Dashboard shows no sessions | Run `$HERMES_PY ~/.hermes/scripts/session_indexer.py --limit 50` manually |
 | Dreams never start | Check `~/.hermes/plugins/dream_auto/resource_monitor.py` for CPU/RAM availability |
-| Queue shows dreams stuck "running" | Run `python3 ~/.hermes/scripts/dream_scheduler.py` once manually — the completion-detection fix (v3.0.1) syncs them |
+| Queue shows dreams stuck "running" | Run `$HERMES_PY ~/.hermes/scripts/dream_scheduler.py` once manually — the completion-detection fix (v3.0.1) syncs them |
 | Upgrade: old files persist | Run Step 4 again — the `rm -rf` before each `cp` ensures clean overwrite |
 | DB errors after upgrade | Run Step 5 again — `CREATE INDEX IF NOT EXISTS` and `CREATE TABLE IF NOT EXISTS` are safe to re-run |
 
