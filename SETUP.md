@@ -226,20 +226,78 @@ chmod +x "$HOME/.local/bin/dream-dashboard"
 
 ### STEP 7 — Register Cron Jobs
 
+Dream Auto needs two recurring jobs:
+- **dream-scheduler** — picks the highest-priority queued dream and starts it (ideally every 30 min)
+- **session-indexer** — scans recent Hermes sessions and grades them for dream potential (ideally every 6h)
+
+Choose how to schedule them:
+
 ```bash
-# dream-scheduler: every 30 minutes — picks highest-priority queued dream and starts it.
-# Cron scripts are executed by Hermes with the same Python runtime as Hermes itself.
-"$HERMES_BIN" cron create "*/30 * * * *" \
+echo "=== Dream Auto Cron Scheduling ==="
+echo "How should the background jobs be scheduled?"
+echo ""
+echo "  [1] Recommended  — scheduler every 30 min, indexer every 6h"
+echo "                    (low resource impact, good for most users)"
+echo ""
+echo "  [2] Custom      — specify your own cron expressions"
+echo "                    (you choose the exact times)"
+echo ""
+echo "  [3] Auto-detect — analyze my Hermes history and pick optimal quiet hours"
+echo "                    (uses LLM API calls to find when your machine is idle)"
+echo ""
+read -p "Select [1/2/3]: " CRON_CHOICE
+
+if [ "$CRON_CHOICE" = "1" ]; then
+    # Recommended defaults
+    SCHEDULER_CRON="*/30 * * * *"
+    INDEXER_CRON="0 */6 * * *"
+    echo "Scheduler: every 30 min | Indexer: every 6h"
+
+elif [ "$CRON_CHOICE" = "2" ]; then
+    echo "Enter dream-scheduler cron expression (e.g. */30 * * * *):"
+    read SCHEDULER_CRON
+    echo "Enter session-indexer cron expression (e.g. 0 */6 * * *):"
+    read INDEXER_CRON
+
+elif [ "$CRON_CHOICE" = "3" ]; then
+    echo "Analyzing your Hermes session history for optimal quiet hours..."
+    # The LLM reads hermes sessions list + resource patterns and picks quiet windows
+    RECOMMENDATION=$("$HERMES_BIN" chat -q \
+        "Analyze the user's Hermes session history from 'hermes sessions list' output. \
+        Find the typical active hours and idle/quiet windows. \
+        Recommend cron schedules that minimise interference with the user's active work. \
+        The dream-scheduler ideally runs every 30 minutes. \
+        The session-indexer ideally runs every 6 hours. \
+        Output ONLY this exact format, nothing else: \
+        SCHEDULER=<cron_expr> INDEXER=<cron_expr>" 2>/dev/null)
+    SCHEDULER_CRON=$(echo "$RECOMMENDATION" | grep -oP 'SCHEDULER=\K[^ ]+')
+    INDEXER_CRON=$(echo "$RECOMMENDATION" | grep -oP 'INDEXER=\K[^ ]+')
+    echo "Auto-detected — Scheduler: $SCHEDULER_CRON | Indexer: $INDEXER_CRON"
+
+    # Fallback if LLM returns nothing useful
+    if [ -z "$SCHEDULER_CRON" ] || [ -z "$INDEXER_CRON" ]; then
+        echo "WARNING: Could not determine optimal schedule. Using recommended defaults."
+        SCHEDULER_CRON="*/30 * * * *"
+        INDEXER_CRON="0 */6 * * *"
+    fi
+else
+    echo "Invalid choice. Using recommended defaults."
+    SCHEDULER_CRON="*/30 * * * *"
+    INDEXER_CRON="0 */6 * * *"
+fi
+
+# Register dream-scheduler
+"$HERMES_BIN" cron create "$SCHEDULER_CRON" \
     --name "dream-scheduler" \
-    --script "$HERMES_HOME/scripts/dream_scheduler.py" \
-    "Run the Dream Auto scheduler script and report its result briefly." \
+    --script "dream_scheduler.py" \
+    "Run the Dream Auto scheduler." \
     2>/dev/null || echo "dream-scheduler cron already registered (skipping)"
 
-# session-indexer: every 6 hours — scans sessions, grades them for dream potential.
-"$HERMES_BIN" cron create "0 */6 * * *" \
+# Register session-indexer
+"$HERMES_BIN" cron create "$INDEXER_CRON" \
     --name "session-indexer" \
-    --script "$HERMES_HOME/scripts/session_indexer.py" \
-    "Run the Dream Auto session indexer script and report its result briefly." \
+    --script "session_indexer.py" \
+    "Run the Dream Auto session indexer." \
     2>/dev/null || echo "session-indexer cron already registered (skipping)"
 ```
 
