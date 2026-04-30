@@ -36,7 +36,8 @@ if [ ! -x "$HERMES_BIN" ]; then
 fi
 
 if [ -z "$HERMES_BIN" ] || [ ! -x "$HERMES_BIN" ]; then
-    echo "ERROR: Hermes CLI not found. Set HERMES_BIN before continuing."
+    echo "ERROR: Hermes CLI not found. Make sure Hermes Agent is installed and in your PATH."
+    echo "If Hermes is installed in a custom location, set HERMES_BIN to the hermes binary path."
     exit 1
 fi
 ```
@@ -66,6 +67,8 @@ else
     "$HERMES_PY" -m ensurepip --upgrade
     "$HERMES_PY" -m pip install -r "$DREAM_AUTO_REPO/requirements.txt"
 fi
+
+"$HERMES_PY" -c "import psutil, rich" 2>/dev/null || echo "WARNING: psutil or rich not importable — check Step 3"
 ```
 
 You do **not** need to activate the virtualenv first when calling the venv's Python directly. `"$HERMES_PY" -m pip ...` installs into that same Hermes virtualenv. If the venv does not have `pip` but `uv` is installed, `uv pip install --python "$HERMES_PY" ...` installs into the same Hermes venv. If you prefer an interactive shell, this equivalent form also works:
@@ -209,9 +212,12 @@ PYEOF
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/dream-dashboard" <<WRAPPER
+cat > "$HOME/.local/bin/dream-dashboard" <<'WRAPPER'
 #!/usr/bin/env bash
-exec "$HERMES_PY" "$HERMES_HOME/scripts/dream_insights_dashboard.py" "\$@"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_VENV="${HERMES_VENV:-$HERMES_HOME/hermes-agent/venv}"
+HERMES_PY="${HERMES_PY:-$HERMES_VENV/bin/python}"
+exec "$HERMES_PY" "$HERMES_HOME/scripts/dream_insights_dashboard.py" "$@"
 WRAPPER
 chmod +x "$HOME/.local/bin/dream-dashboard"
 ```
