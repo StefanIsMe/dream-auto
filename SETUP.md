@@ -104,7 +104,7 @@ cp "$DREAM_AUTO_REPO/scripts/dream_insights_dashboard.py" "$HERMES_HOME/scripts/
 cp "$DREAM_AUTO_REPO/scripts/session_indexer.py" "$HERMES_HOME/scripts/"
 cp "$DREAM_AUTO_REPO/scripts/session_grader.py" "$HERMES_HOME/scripts/"
 
-# Copy skills
+# Copy skills (MCTS engine + fast_path分流)
 cp -r "$DREAM_AUTO_REPO/skills/autonomous-ai-agents/hermes-dream-task" \
     "$HERMES_HOME/skills/autonomous-ai-agents/"
 cp -r "$DREAM_AUTO_REPO/skills/ops/dream-system-v3" \
@@ -227,8 +227,8 @@ chmod +x "$HOME/.local/bin/dream-dashboard"
 ### STEP 7 — Register Cron Jobs
 
 Dream Auto needs two recurring jobs:
-- **dream-scheduler** — picks the highest-priority queued dream and starts it (ideally every 30 min)
-- **session-indexer** — scans recent Hermes sessions and grades them for dream potential (ideally every 6h)
+- **dream-scheduler** — picks the highest-priority queued dream and starts it (every 30 min)
+- **session-indexer** — scans recent Hermes sessions and grades them for dream potential (every 6h)
 
 Choose how to schedule them:
 
@@ -264,12 +264,12 @@ elif [ "$CRON_CHOICE" = "3" ]; then
     # The LLM reads hermes sessions list + resource patterns and picks quiet windows
     RECOMMENDATION=$("$HERMES_BIN" chat -q \
         "Analyze the user's Hermes session history from 'hermes sessions list' output. \
-        Find the typical active hours and idle/quiet windows. \
-        Recommend cron schedules that minimise interference with the user's active work. \
-        The dream-scheduler ideally runs every 30 minutes. \
-        The session-indexer ideally runs every 6 hours. \
-        Output ONLY this exact format, nothing else: \
-        SCHEDULER=<cron_expr> INDEXER=<cron_expr>" 2>/dev/null)
+Find the typical active hours and idle/quiet windows. \
+Recommend cron schedules that minimise interference with the user's active work. \
+The dream-scheduler ideally runs every 30 minutes. \
+The session-indexer ideally runs every 6 hours. \
+Output ONLY this exact format, nothing else: \
+SCHEDULER=<cron_expr> INDEXER=<cron_expr>" 2>/dev/null)
     SCHEDULER_CRON=$(echo "$RECOMMENDATION" | grep -oP 'SCHEDULER=\K[^ ]+')
     INDEXER_CRON=$(echo "$RECOMMENDATION" | grep -oP 'INDEXER=\K[^ ]+')
     echo "Auto-detected — Scheduler: $SCHEDULER_CRON | Indexer: $INDEXER_CRON"
@@ -343,6 +343,7 @@ ls "$HERMES_HOME/scripts/session_grader.py"
 
 echo "=== Skills ==="
 ls "$HERMES_HOME/skills/autonomous-ai-agents/hermes-dream-task/scripts/dream_loop_v3.py"
+ls "$HERMES_HOME/skills/autonomous-ai-agents/hermes-dream-task/scripts/fast_path.py"
 ls "$HERMES_HOME/skills/ops/dream-system-v3/SKILL.md"
 
 echo "=== Databases ==="
@@ -395,20 +396,30 @@ dream-auto/
 ├── SETUP.md               # This file — agent-executable install/upgrade guide
 ├── README.md              # Human-readable overview
 ├── requirements.txt       # psutil, rich
+├── pytest.ini             # Test configuration
 ├── plugins/
-│   └── dream_auto/       # __init__.py, resource_monitor.py, plugin.yaml
+│   └── dream_auto/
+│       ├── __init__.py           # Main plugin (6 hooks)
+│       ├── plugin.yaml           # Plugin manifest
+│       ├── resource_monitor.py   # CPU/RAM monitoring
+│       └── tests/
+│           ├── __init__.py
+│           ├── test_dream_auto_plugin.py
+│           └── test_resource_monitor.py
 ├── scripts/
-│   ├── dream_scheduler.py         # Queue manager + wallclock killer + knowledge cache sync
+│   ├── dream_scheduler.py         # Queue manager + wallclock killer
 │   ├── dream_insights_dashboard.py # CLI dashboard
-│   ├── session_indexer.py          # Session scanner + grader
-│   └── session_grader.py           # LLM-based potential scorer
+│   ├── session_indexer.py         # Session scanner + grader
+│   ├── session_grader.py           # LLM-based potential scorer
+│   └── dream_loop_v3.py            # MCTS engine v3 (also in skills/)
 └── skills/
-    ├── autonomous-ai-agents/hermes-dream-task/
-    │   ├── scripts/dream_loop_v3.py  # MCTS engine v3
-    │   ├── scripts/fast_path.py       # Heuristic分流
-    │   └── SKILL.md
-    └── ops/dream-system-v3/
-        └── SKILL.md
+    └── autonomous-ai-agents/
+        └── hermes-dream-task/
+            ├── SKILL.md
+            └── scripts/
+                ├── dream_loop_v3.py  # MCTS engine v3 — two-tier AIAgent
+                ├── fast_path.py       # Heuristic分流 (fast/slow path)
+                └── test_tool_rollouts.py
 ```
 
 ---
@@ -425,7 +436,7 @@ dream-auto/
 | `dream-dashboard` not found | `~/.local/bin` not in PATH. Use `$HERMES_PY ~/.hermes/scripts/dream_insights_dashboard.py` instead |
 | Cron jobs not firing | Run `$HERMES_BIN gateway start` |
 | Dashboard shows no sessions | Run `$HERMES_PY ~/.hermes/scripts/session_indexer.py --limit 50` manually |
-| Dreams never start | Check `~/.hermes/plugins/dream_auto/resource_monitor.py` for CPU/RAM availability |
+| Dreams never start | Check resources: CPU must be < 70% AND RAM < 70% for scheduler to start dreams |
 | Queue shows dreams stuck "running" | Run `$HERMES_PY ~/.hermes/scripts/dream_scheduler.py` once manually — the completion-detection fix (v3.0.1) syncs them |
 | Upgrade: old files persist | Run Step 4 again — the `rm -rf` before each `cp` ensures clean overwrite |
 | DB errors after upgrade | Run Step 5 again — `CREATE INDEX IF NOT EXISTS` and `CREATE TABLE IF NOT EXISTS` are safe to re-run |

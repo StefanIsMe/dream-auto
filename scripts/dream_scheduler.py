@@ -31,6 +31,17 @@ DREAM_LOOP_V3 = Path.home() / ".hermes" / "skills" / "autonomous-ai-agents" / "h
 
 GMT7 = timezone(timedelta(hours=7))
 
+
+def _parse_ts(ts_str: str) -> float | None:
+    """Parse an ISO timestamp string (with timezone) to a Unix float. Returns None on failure."""
+    if not ts_str:
+        return None
+    try:
+        # Handles "2026-05-01T00:00:13.200912+07:00" and similar
+        return datetime.fromisoformat(ts_str).timestamp()
+    except Exception:
+        return None
+
 # Add scripts dir to path for resource_monitor import
 sys.path.insert(0, str(Path.home() / ".hermes" / "plugins" / "dream_auto"))
 
@@ -95,7 +106,10 @@ def sync_dream_status() -> list[dict]:
             continue
 
         dream_id = meta.get("dream_id", d.name)
+        # Use meta.json status if present, otherwise fall back to status.txt
         meta_status = meta.get("status", "")
+        if not meta_status and status_file.exists():
+            meta_status = status_file.read_text().strip()
 
         # ── Case 1: normally completed ────────────────────────────────────────
         if meta_status in ("done", "completed"):
@@ -105,6 +119,16 @@ def sync_dream_status() -> list[dict]:
         # ── Case 2: wallclock exceeded ─────────────────────────────────────────
         if meta_status == "running":
             started_at = meta.get("started_at")
+            if started_at is None:
+                # Fallback: get started time from queue DB
+                conn = sqlite3.connect(str(DREAM_QUEUE_DB))
+                row = conn.execute(
+                    "SELECT started_at FROM dream_queue WHERE dream_id=?",
+                    (dream_id,)
+                ).fetchone()
+                conn.close()
+                if row and row[0]:
+                    started_at = _parse_ts(row[0])
             if started_at is not None:
                 elapsed = now - started_at
                 if elapsed > DREAM_WALLCLOCK_SECONDS:

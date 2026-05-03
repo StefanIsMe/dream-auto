@@ -129,6 +129,35 @@ cat ~/.hermes/state/dream/<id>/insights.json | python3 -m json.tool
 cat ~/.hermes/state/dream/<id>/exploration_tree.json | python3 -m json.tool
 ```
 
+## Pitfalls (v3 — dream_loop_v3.py)
+
+### Python scoping bugs to watch for
+
+1. **`math` vs `_math` alias** — Top of file does `import math as _math` (line 52).
+   Any call to `math.sqrt()` must use `_math.sqrt()`. The `NameError: name 'math'
+   is not defined` silently crashes `mcts_backpropagate` at line 350.
+
+2. **Local variable shadows global constant** — `generate_branches()` defines a local
+   `MAX_CHILDREN_PER_NODE` variable (line ~180) that shadows the module-level constant.
+   F-strings inside the function see the local (unassigned) name → `UnboundLocalError`.
+   Rename the local variable to something like `max_children`.
+
+3. **`read_meta` / `write_meta` definition ordering** — These are defined at lines 898-905,
+   well after `mcts_loop` (line 688) which calls them. Python does not hoist function
+   definitions. All helpers must be defined BEFORE the function that uses them.
+   Move `read_meta` and `write_meta` above `mcts_loop`.
+
+### Dashboard error misreporting
+
+The `dashboard.html` error table only shows the first line of each traceback (the
+"File" line) and categorises everything as `FileNotFoundError`. Actual error types
+found in crashed dreams:
+- `NameError: name 'math' is not defined` — mcts_backpropagate line 350
+- `UnboundLocalError` — generate_branches line 172
+- `NameError: name 'read_meta' is not defined` — mcts_loop line 580
+
+To get full tracebacks, read `~/.hermes/state/dream/<dream_id>/dream_output.log`.
+
 ## Research Papers
 
 Key papers informing this architecture:

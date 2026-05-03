@@ -12,6 +12,9 @@ Plugin config env vars:
   DREAM_AUTO_ENABLED=1       — disable entirely
   DREAM_AUTO_VERBOSE=1       — log activity
   DREAM_AUTO_MAX_INJECT=3    — max dreams to inject per turn (default 3)
+  DREAM_AUTO_THROTTLE_TURNS=5 — post_llm_call fires at most every N turns (default 5)
+  DREAM_AUTO_GLOBAL_THROTTLE=300 — global per-turn budget: skip hook entirely every N seconds (default 300 = 5min)
+  DREAM_AUTO_KNOWLEDGE_CACHE_TTL_DAYS=7 — TTL for knowledge cache entries (default 7)
 """
 
 from __future__ import annotations
@@ -28,18 +31,21 @@ from typing import Any, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ENABLED_ENV  = "DREAM_AUTO_ENABLED"
-VERBOSE_ENV  = "DREAM_AUTO_VERBOSE"
-MAX_INJECT_ENV = "DREAM_AUTO_MAX_INJECT"
-THROTTLE_ENV = "DREAM_AUTO_THROTTLE_TURNS"  # fire hook at most every N turns (default 5)
+ENABLED_ENV          = "DREAM_AUTO_ENABLED"
+VERBOSE_ENV          = "DREAM_AUTO_VERBOSE"
+MAX_INJECT_ENV       = "DREAM_AUTO_MAX_INJECT"
+THROTTLE_ENV         = "DREAM_AUTO_THROTTLE_TURNS"
+GLOBAL_THROTTLE_ENV  = "DREAM_AUTO_GLOBAL_THROTTLE"
+KC_TTL_ENV           = "DREAM_AUTO_KNOWLEDGE_CACHE_TTL_DAYS"
 
 GMT7 = timezone(timedelta(hours=7))
-DREAM_DIR = Path.home() / ".hermes" / "state" / "dream"
-DREAM_QUEUE_DB = Path.home() / ".hermes" / "state" / "dream" / "dream_queue.db"
-KNOWLEDGE_CACHE_DB = Path.home() / ".hermes" / "state" / "dream" / "knowledge_cache.db"
+DREAM_DIR            = Path.home() / ".hermes" / "state" / "dream"
+DREAM_QUEUE_DB       = Path.home() / ".hermes" / "state" / "dream" / "dream_queue.db"
+KNOWLEDGE_CACHE_DB   = Path.home() / ".hermes" / "state" / "dream" / "knowledge_cache.db"
 
-_session_injected: Dict[str, Set[str]] = {}  # session_id → set of dream_ids
-_session_turn_counter: Dict[str, int] = {}  # session_id → turn count since last dream check
+_session_injected:       Dict[str, Set[str]] = {}  # session_id → set of dream_ids
+_session_turn_counter:   Dict[str, int]    = {}  # session_id → turn count since last dream check
+_last_global_hook_ts:    float             = -300.0  # sentinel: -300 so first call always passes
 
 # ── Cached fast_path import (avoid re-import on every hook call) ───────────────
 _fast_path_module = None
@@ -76,6 +82,30 @@ def _throttle_turns() -> int:
     except ValueError:
         return 5
 
+def _global_throttle_seconds() -> int:
+    """Skip pre_llm_call if hook ran less than N seconds ago (default 300s = 5min)."""
+    try:
+        return int(os.environ.get(GLOBAL_THROTTLE_ENV, "300"))
+    except ValueError:
+        return 300
+
+def _knowledge_cache_ttl_days() -> int:
+    """TTL in days for knowledge cache entries (default 7)."""
+    try:
+        return int(os.environ.get(KC_TTL_ENV, "7"))
+    except ValueError:
+        return 7
+
+
+# ── Done-status normalization ─────────────────────────────────────────────────
+
+# v3 meta.json uses non-standard status values. Normalize everything here.
+_STATUS_DONE = {
+    "done", "completed", "completed_killed", "failed_crash",
+    "killed_wallclock", "completed_stale", "stale_completed",
+    "completed_empty",
+}
+
 
 # ── File helpers ─────────────────────────────────────────────────────────────
 
@@ -104,7 +134,18 @@ def _read_meta(dream_id: str) -> dict:
     return _read_json(_dream_path(dream_id) / "meta.json", default={})
 
 def _read_pending_questions(dream_id: str) -> List[str]:
-    return _read_json(_dream_path(dream_id) / "pending_questions.json", default=[])
+    """Returns list (possibly empty) from pending_questions.json.
+    Returns [] for both missing file AND invalid JSON — caller use has_insights_or_questions()
+    to distinguish "has content" from "nothing to report".
+    """
+    path = _dream_path(dream_id) / "pending_questions.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
 def _read_knowledge_cache(topic_hints: list[str] = None, limit: int = 3, session_id: str = None) -> List[str]:
@@ -126,8 +167,9 @@ def _read_knowledge_cache(topic_hints: list[str] = None, limit: int = 3, session
         except Exception:
             pass
 
-        # 7-day TTL — skip entries older than this
-        age_cutoff = (datetime.now(GMT7) - timedelta(days=7)).isoformat()
+        # Configurable TTL — skip entries older than this
+        ttl_days = _knowledge_cache_ttl_days()
+        age_cutoff = (datetime.now(GMT7) - timedelta(days=ttl_days)).isoformat()
 
         if topic_hints:
             # Match entries by topic, most recent first, within TTL
@@ -177,44 +219,85 @@ def _read_knowledge_cache(topic_hints: list[str] = None, limit: int = 3, session
     except Exception:
         return []
 
-def _list_completed_dreams() -> List[dict]:
-    """List all completed dreams for insight injection."""
+def _has_insights_or_questions(dream_id: str) -> bool:
+    """True if dream has non-empty insights OR pending questions."""
+    insights = _read_json(_dream_path(dream_id) / "insights.json", None)
+    if insights and isinstance(insights, list) and len(insights) > 0:
+        return True
+    questions = _read_pending_questions(dream_id)
+    return len(questions) > 0
+
+
+def _list_completed_dreams(topic_hints: list[str] = None) -> List[dict]:
+    """List all completed dreams suitable for insight injection.
+
+    Args:
+        topic_hints: if provided, only return dreams whose brief contains any of these hints.
+                     This pre-filters before the expensive _distill_insights call.
+    """
     if not DREAM_DIR.exists():
         return []
 
+    hints_lower = [h.lower() for h in (topic_hints or [])]
+
     dreams = []
-    for dream_path in sorted(DREAM_DIR.iterdir()):
+    for dream_path in sorted(DREAM_DIR.iterdir(), reverse=True):  # newest first
         if not dream_path.is_dir():
             continue
         meta = _read_json(dream_path / "meta.json", {})
-        if meta.get("status") not in ("done", "completed"):
+        # Normalize done statuses (v3 uses many variants)
+        if meta.get("status") not in _STATUS_DONE:
             continue
-        insights = _read_insights(dream_path.name)
-        confidence = meta.get("confidence", 0.0)
-        if insights:  # only include dreams with actual insights
-            dreams.append({
-                "id": dream_path.name,
-                "brief": meta.get("brief", "")[:200],
-                "confidence": confidence,
-                "insight_count": len(insights),
-            })
+        # Skip dreams with no content to inject
+        if not _has_insights_or_questions(dream_path.name):
+            continue
+        # Topic pre-filter: skip if brief doesn't match any topic hint
+        if hints_lower:
+            brief_lower = meta.get("brief", "").lower()
+            if not any(hint in brief_lower for hint in hints_lower):
+                continue
 
-    # Sort by confidence desc
-    dreams.sort(key=lambda d: d["confidence"], reverse=True)
+        # v3 uses best_confidence, v2 uses confidence
+        confidence = meta.get("best_confidence", meta.get("confidence", 0.0))
+        dreams.append({
+            "id": dream_path.name,
+            "brief": meta.get("brief", "")[:200],
+            "confidence": confidence,
+            "topics": meta.get("topics", []),
+        })
+
+    # Sort by confidence desc, newest first for equal confidence
+    dreams.sort(key=lambda d: (d["confidence"], 0), reverse=True)
     return dreams
 
 
 # ── Queue helpers ────────────────────────────────────────────────────────────
 
 def _add_to_queue(session_id: str, brief: str, grade: float = None, priority: float = None):
-    """Add a dream to the scheduler queue."""
+    """Add a dream to the scheduler queue.
+
+    Deduplication: if a queued or running dream with the same session_id AND
+    a brief starting with the same 60 chars already exists, skip creating a duplicate.
+
+    DEGENERATE LOOP GUARD: Skip sessions that are themselves dream products or
+    cron jobs — these generate self-reinforcing feedback loops where the dream
+    loop's LLM calls create sessions that get re-queued indefinitely.
+    """
     import sqlite3, uuid
+
+    # ── Degenerate loop guard ──────────────────────────────────────────────────
+    # Skip dream-generated sessions (created by dream_loop_v3's hermes chat -q calls)
+    # and cron job sessions — they create feedback loops
+    if session_id.startswith("dream") or "dream" in session_id.lower():
+        return None
+    if session_id.startswith("cron_"):
+        return None
+
     if grade is None:
         grade = 0.7  # default for error-triggered
     if priority is None:
         priority = grade + 0.1  # error dreams get slight priority boost
 
-    dream_id = str(uuid.uuid4())[:8]
     DREAM_DIR.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(DREAM_QUEUE_DB))
@@ -233,14 +316,32 @@ def _add_to_queue(session_id: str, brief: str, grade: float = None, priority: fl
             status TEXT DEFAULT 'queued'
         )
     """)
+
+    # ── Deduplication check ──────────────────────────────────────────────────
+    # Skip if an active dream with the same session and similar brief already exists
+    brief_prefix = brief[:60]
+    existing = conn.execute("""
+        SELECT dream_id, status FROM dream_queue
+        WHERE session_id = ?
+          AND dream_question LIKE ?
+          AND status IN ('queued', 'running')
+        LIMIT 1
+    """, (session_id, brief_prefix + "%")).fetchone()
+
+    if existing is not None:
+        conn.close()
+        return existing[0]  # return existing dream_id so caller knows
+
+    # ── Insert new dream ─────────────────────────────────────────────────────
+    new_dream_id = str(uuid.uuid4())[:8]
     conn.execute("""
         INSERT OR IGNORE INTO dream_queue
             (session_id, dream_id, dream_question, grade, priority, created_at, status)
         VALUES (?, ?, ?, ?, ?, ?, 'queued')
-    """, (session_id, dream_id, brief[:1000], grade, priority, datetime.now(GMT7).isoformat()))
+    """, (session_id, new_dream_id, brief[:1000], grade, priority, datetime.now(GMT7).isoformat()))
     conn.commit()
     conn.close()
-    return dream_id
+    return new_dream_id
 
 
 # ── Insight distillation ───────────────────────────────────────────────────────
@@ -250,7 +351,10 @@ def _distill_insights(dream_id: str) -> str:
     insights = _read_insights(dream_id)
     meta = _read_meta(dream_id)
     questions = _read_pending_questions(dream_id)
-    confidence = meta.get("confidence", 0.0)
+    # v3 uses best_confidence, v2 uses confidence
+    confidence = meta.get("best_confidence", meta.get("confidence", 0.0))
+    started_at = meta.get("started_at", "")
+    status = meta.get("status", "unknown")
 
     if not insights and not questions:
         return ""
@@ -258,6 +362,9 @@ def _distill_insights(dream_id: str) -> str:
     parts = []
     parts.append(f"[INTERNAL CONTEXT — use silently, do NOT mention to user.]")
     parts.append(f"[DREAM INSIGHTS: {dream_id} | confidence: {confidence:.0%}]")
+
+    if started_at:
+        parts.append(f"  Status: {status} | started: {started_at[:16]}")
 
     if insights:
         for insight in insights[-3:]:
@@ -271,30 +378,90 @@ def _distill_insights(dream_id: str) -> str:
 
 # ── Error detection ───────────────────────────────────────────────────────────
 
+# HTTP server errors — 5xx are transient, 429 is rate limit (exponential backoff)
+# 403 often means auth/session expired (CDP, LinkedIn, etc.)
+_ERROR_SIGNALS = [
+    "Traceback", "Error:", "Exception:", "error:",
+    "ModuleNotFound", "ImportError", "TypeError", "ValueError",
+    "SyntaxError", "AttributeError", "KeyError", "RuntimeError",
+    "command not found", "No such file", "Permission denied",
+    "FATAL", "CRITICAL", "panic:",
+    # HTTP errors
+    "HTTPStatusError", "500", "502", "503",           # server errors (exponential backoff)
+    "429",                                              # rate limit (exponential backoff)
+    "403",                                              # forbidden — auth/session expired
+    "401",                                              # unauthorized
+    # CDP / browser automation
+    "CDPTimeout", "cdp_timeout", "WebSocketTimeoutError",
+    "NavigationTimeout", "TimeoutError",
+    # Git / cron / CI
+    "commit failed", "CONFLICT", "Merge conflict",
+    "fatal:",                                           # git failures
+    # Auth / session
+    "expired", "session revoked", "token expired",
+    "auth failure", "AuthError", "AuthenticationError",
+    # Sandboxing / security
+    "Operation not permitted", "SECURITY ERROR",
+]
+
+# Regex patterns for structured extraction from errors
+_HTTP_STATUS_RE   = re.compile(r"\b([45]\d{2})\b")           # 400, 403, 429, 500, etc.
+_ERROR_TYPE_RE    = re.compile(r"(\w+(?:Error|Exception|Unavailable))\b")
+_HOST_PORT_RE     = re.compile(r"(?:https?://)?([\w.-]+)(?::(\d+))?")
+_INVALID_TOKEN_RE = re.compile(r"(?:li_at| csrf| session| auth).*?(?:invalid|expired|revoked)", re.I)
+
+
 def _is_error_output(output: str) -> bool:
-    error_signals = [
-        "Traceback", "Error:", "Exception:", "error:",
-        "ModuleNotFound", "ImportError", "TypeError", "ValueError",
-        "SyntaxError", "AttributeError", "KeyError", "RuntimeError",
-        "command not found", "No such file", "Permission denied",
-        "FATAL", "CRITICAL", "panic:",
-    ]
-    return any(sig in output for sig in error_signals)
+    return any(sig in output for sig in _ERROR_SIGNALS)
+
+
+def _extract_error_context(error: str) -> dict:
+    """Extract structured context from an error string for richer brief generation."""
+    ctx = {"http_status": None, "error_type": None, "host": None, "port": None}
+
+    m = _HTTP_STATUS_RE.search(error)
+    if m:
+        ctx["http_status"] = int(m.group(1))
+
+    m = _ERROR_TYPE_RE.search(error)
+    if m:
+        ctx["error_type"] = m.group(1)
+
+    m = _HOST_PORT_RE.search(error)
+    if m:
+        ctx["host"] = m.group(1)
+        if m.group(2):
+            ctx["port"] = int(m.group(2))
+
+    return ctx
 
 
 def _auto_brief_from_error(tool_name: str, error: str) -> str:
-    """Generate a troubleshooting dream brief from an error."""
-    error_type = "unknown error"
-    for pattern in [r"(\w+Error)", r"(\w+Exception)", r"(error:\s*.+)"]:
-        m = re.search(pattern, error)
-        if m:
-            error_type = m.group(1)
-            break
+    """Generate a troubleshooting dream brief from an error.
+
+    Extracts structured context (HTTP status, error type, host/port) to produce
+    a more targeted brief than the generic error-type extraction.
+    """
+    ctx = _extract_error_context(error)
+    error_type = ctx.get("error_type") or "unknown error"
+    http_status = ctx.get("http_status")
+    host = ctx.get("host")
+
+    # Build contextual hint from structured extraction
+    context_hints = []
+    if http_status:
+        context_hints.append(f"HTTP {http_status}")
+    if host:
+        context_hints.append(f"host={host}")
+    if ctx.get("port"):
+        context_hints.append(f"port={ctx['port']}")
+
+    ctx_str = " | ".join(context_hints) if context_hints else error[:300]
 
     return (
         f"Troubleshoot this error that occurred during {tool_name}:\n\n"
-        f"Error: {error_type}\n"
-        f"Context: {error[:300]}\n\n"
+        f"Error type: {error_type}\n"
+        f"Context: {ctx_str}\n\n"
         f"Approach: systematic root cause analysis.\n"
         f"1. What are the most likely causes?\n"
         f"2. What evidence confirms/refutes each?\n"
@@ -313,7 +480,8 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
-    logger.info("dream_auto v3: registered 6 hooks (scheduler + error-path only)")
+    logger.info("dream_auto v3.1: registered 6 hooks — global throttle, topic pre-filter, "
+                "dedup queue, expanded error signals, configurable KC TTL")
 
 
 def _on_pre_llm_call(
@@ -329,16 +497,27 @@ def _on_pre_llm_call(
     HOOK 1: Inject distilled insights from completed dreams.
     NO longer auto-starts dreams here — scheduler handles that.
     FAST PATH: skip all work for trivially simple queries.
+
+    Global throttle: skip this hook if it ran less than N seconds ago.
+    Topic pre-filtering: extract topic hints from user message, pre-filter
+    completed dreams before calling _distill_insights (avoids wasted LLM-call
+    time on dreams that don't match the current topic).
     """
+    global _last_global_hook_ts
+
     if not _enabled() or not user_message or len(user_message.strip()) < 5:
         return None
 
     if not DREAM_DIR.exists():
         return None
 
-    # ── FAST PATH: bypass file I/O for trivially simple queries ─────────────────
-    # _list_completed_dreams() does a full DREAM_DIR scan (~45ms on 652 dirs).
-    # Skip it entirely for queries that can't benefit from dream insights.
+    # ── Global throttle: skip if hook fired recently ──────────────────────────
+    now = time.monotonic()
+    if now - _last_global_hook_ts < _global_throttle_seconds():
+        return None
+    _last_global_hook_ts = now
+
+    # ── FAST PATH: bypass file I/O for trivially simple queries ──────────────
     _fast = _get_fast_path()
     if _fast is not None:
         try:
@@ -348,8 +527,24 @@ def _on_pre_llm_call(
         except Exception:
             pass  # fast_path failed — proceed with normal path
 
+    # ── Topic hints: extract from user message for pre-filtering ─────────────
+    _topic_keywords = {
+        "linkedin": ["linkedin", "li_at", "org2", "social post", "engagement"],
+        "research": ["research", "arxiv", "paper", "study", "academic"],
+        "coding": ["python", "javascript", "typescript", "rust", "debug", "api", "coding"],
+        "browser": ["chrome", "cdp", "selenium", "scraper", "camoufox", "browser"],
+        "database": ["sqlite", "postgres", "sql", "db", "query", "database"],
+        "hermes": ["hermes", "agent", "cron", "plugin", "hook", "delegate"],
+        "web": ["website", "seo", "cloudflare", "deployment", "http", "web"],
+        "vietnam": ["vietnam", "hcmc", "tay ninh", "vnd"],
+        "content": ["article", "blog", "writing", "seo", "content"],
+        "ai": ["llm", "gpt", "claude", "model", "ai", "inference"],
+    }
+    msg_lower = user_message.lower()
+    topic_hints = [t for t, kws in _topic_keywords.items() if any(kw in msg_lower for kw in kws)]
+
     parts = []
-    completed = _list_completed_dreams()
+    completed = _list_completed_dreams(topic_hints=topic_hints)
     injected = _session_injected.get(session_id, set())
 
     for dream in completed[:_max_inject()]:
@@ -365,21 +560,6 @@ def _on_pre_llm_call(
         _session_injected[session_id] = injected
 
     # ── Knowledge cache: predictive pre-warmed context ────────────────────────
-    # Extract topic hints from user message
-    _topic_keywords = {
-        "linkedin": ["linkedin", "li_at", "org2", "social post", "engagement"],
-        "research": ["research", "arxiv", "paper", "study", "academic"],
-        "coding": ["python", "javascript", "typescript", "rust", "debug", "api", "coding"],
-        "browser": ["chrome", "cdp", "selenium", "scraper", "camoufox", "browser"],
-        "database": ["sqlite", "postgres", "sql", "db", "query", "database"],
-        "hermes": ["hermes", "agent", "cron", "plugin", "hook", "delegate"],
-        "web": ["website", "seo", "cloudflare", "deployment", "http", "web"],
-        "vietnam": ["vietnam", "hcmc", "tay ninh", "vnd"],
-        "content": ["article", "blog", "writing", "seo", "content"],
-        "ai": ["llm", "gpt", "claude", "model", "ai", "inference"],
-    }
-    msg_lower = user_message.lower()
-    topic_hints = [t for t, kws in _topic_keywords.items() if any(kw in msg_lower for kw in kws)]
     knowledge_entries = _read_knowledge_cache(topic_hints=topic_hints, limit=2, session_id=session_id)
     if knowledge_entries:
         parts.append("[KNOWLEDGE CACHE — pre-warmed from session index]\n" +
@@ -522,25 +702,17 @@ def _on_session_start(
     platform: str = "",
     **kwargs: Any,
 ) -> None:
-    """HOOK 5: Log active dreams at session start."""
+    """HOOK 5: Lightweight session start — clear tracking only.
+
+    Does NOT do a full DREAM_DIR scan (that was causing ~45ms slowdown on
+    652 dream dirs per session start). Active dream info is available via
+    the scheduler/dashboard, not needed at session start.
+    """
     if not _enabled():
         return
 
-    if not DREAM_DIR.exists():
-        return
-
-    try:
-        completed = _list_completed_dreams()
-        if completed and _verbose():
-            best = completed[0]
-            logger.info(f"dream_auto v3 session_start: {len(completed)} completed dreams, "
-                       f"best: {best['id']}(conf={best['confidence']:.0%})")
-
-        _session_injected.pop(session_id, None)
-        _session_turn_counter.pop(session_id, None)
-
-    except Exception as e:
-        logger.debug(f"dream_auto v3 session_start failed: {e}")
+    _session_injected.pop(session_id, None)
+    _session_turn_counter.pop(session_id, None)
 
 
 def _on_session_end(

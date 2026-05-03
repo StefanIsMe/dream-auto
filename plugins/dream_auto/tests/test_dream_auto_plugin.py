@@ -24,10 +24,12 @@ def clean_imports():
     dma._session_injected.clear()
     dma._session_turn_counter.clear()
     dma._fast_path_module = None
+    dma._last_global_hook_ts = -300.0  # reset global throttle sentinel
     yield
     dma._session_injected.clear()
     dma._session_turn_counter.clear()
     dma._fast_path_module = None
+    dma._last_global_hook_ts = -300.0
 
 
 @pytest.fixture
@@ -398,60 +400,112 @@ class TestPreLlmCall:
         )
         assert result is None
 
-    def test_injects_insights_for_new_session(self, mock_enabled, sample_dream, monkeypatch):
+    def test_global_throttle_skips_recent_call(self, mock_enabled, dream_dir, monkeypatch):
+        """If hook ran < 300s ago, it returns None immediately (no file I/O)."""
         import dream_auto.__init__ as dma
-        # Reset per-session state
+        monkeypatch.setenv("HOME", str(dream_dir.parent.parent.parent))
+
+        # Simulate a very recent call: set global throttle to 1 second ago
+        dma._last_global_hook_ts = time.monotonic() - 1
+
+        with patch.object(dma, "_list_completed_dreams") as mock_list:
+            result = dma._on_pre_llm_call(
+                user_message="Tell me about hermes agent cron jobs and linkedin",
+                conversation_history=[],
+                is_first_turn=False,
+                model="test",
+                platform="test",
+                session_id="throttle_test",
+            )
+            # Should have returned None immediately — no file I/O at all
+            assert result is None
+            mock_list.assert_not_called()
+
+    def test_injects_insights_for_new_session(self, mock_enabled, sample_dream, monkeypatch):
+        """Verifies insights are injected for a session that hasn't received them yet.
+
+        Patches _list_completed_dreams to return sample_dream directly,
+        bypassing topic pre-filter so we test the injection logic, not filtering.
+        """
+        import dream_auto.__init__ as dma
+        monkeypatch.setenv("HOME", str(sample_dream[1].parent.parent.parent))
+        # Reset per-session state and global throttle
         dma._session_injected.clear()
         dma._session_turn_counter.clear()
+        dma._last_global_hook_ts = -300.0
 
-        result = dma._on_pre_llm_call(
-            user_message="How do I fix LinkedIn cookie expiry issues?",
-            conversation_history=[],
-            is_first_turn=False,
-            model="test",
-            platform="test",
-            session_id="brand_new_session",
-        )
+        did, _ = sample_dream
+
+        # Patch _list_completed_dreams to return our sample dream (skip topic filter)
+        with patch.object(dma, "_list_completed_dreams", return_value=[{
+            "id": did,
+            "brief": "Test dream for unit testing",
+            "confidence": 0.82,
+            "topics": [],
+        }]):
+            result = dma._on_pre_llm_call(
+                user_message="Tell me about automated systems and cron job failures",
+                conversation_history=[],
+                is_first_turn=False,
+                model="test",
+                platform="test",
+                session_id="brand_new_session",
+            )
+
         assert result is not None
         assert "context" in result
         assert "DREAM INSIGHTS" in result["context"]
 
     def test_does_not_reinject_same_dream(self, mock_enabled, sample_dream, monkeypatch):
+        """Once a session has received a dream, it is not reinjected."""
         import dream_auto.__init__ as dma
+        monkeypatch.setenv("HOME", str(sample_dream[1].parent.parent.parent))
         dma._session_injected.clear()
         dma._session_turn_counter.clear()
+        dma._last_global_hook_ts = -300.0
 
         sid = "reuse_test_session"
+        did, _ = sample_dream
 
-        # First call
-        r1 = dma._on_pre_llm_call(
-            user_message="Fix the LinkedIn cron job failure",
-            conversation_history=[],
-            is_first_turn=False,
-            model="test",
-            platform="test",
-            session_id=sid,
-        )
-        count1 = r1["context"].count("DREAM INSIGHTS")
+        # Patch _list_completed_dreams to return sample dream (skip topic filter)
+        with patch.object(dma, "_list_completed_dreams", return_value=[{
+            "id": did,
+            "brief": "Test dream for unit testing",
+            "confidence": 0.82,
+            "topics": [],
+        }]):
+            # First call — reset global throttle so it fires
+            r1 = dma._on_pre_llm_call(
+                user_message="Tell me about automated systems and cron job failures",
+                conversation_history=[],
+                is_first_turn=False,
+                model="test",
+                platform="test",
+                session_id=sid,
+            )
+            assert r1 is not None
+            count1 = r1["context"].count("DREAM INSIGHTS")
 
-        # Second call same session — should be skipped
-        r2 = dma._on_pre_llm_call(
-            user_message="Tell me more about the cookie issue",
-            conversation_history=[],
-            is_first_turn=False,
-            model="test",
-            platform="test",
-            session_id=sid,
-        )
-        # No new insights injected (same dream already injected)
-        assert r2 is None  # fast-path skips or injected set prevents re-injection
+            # Second call same session — should be skipped (injected set prevents re-injection)
+            dma._last_global_hook_ts = -300.0  # reset throttle again
+            r2 = dma._on_pre_llm_call(
+                user_message="Tell me more about cookie issues",
+                conversation_history=[],
+                is_first_turn=False,
+                model="test",
+                platform="test",
+                session_id=sid,
+            )
+            assert r2 is None  # same session already received this dream
 
     def test_injects_multiple_dreams_up_to_max(self, mock_enabled, dream_dir, monkeypatch):
         import dream_auto.__init__ as dma
+        monkeypatch.setenv("HOME", str(dream_dir.parent.parent.parent))
         dma._session_injected.clear()
         dma._session_turn_counter.clear()
+        dma._last_global_hook_ts = -300.0
 
-        # Create 4 completed dreams
+        # Create 4 completed dreams with generic briefs (no topic filtering)
         for i in range(4):
             did = f"multi{i}"
             dp = dream_dir / did
@@ -464,7 +518,7 @@ class TestPreLlmCall:
 
         with patch.object(dma, "_max_inject", return_value=3):
             result = dma._on_pre_llm_call(
-                user_message="Tell me about hermes agent cron jobs and linkedin integration",
+                user_message="Tell me about complex system issues and automation",
                 conversation_history=[],
                 is_first_turn=False,
                 model="test",
@@ -717,8 +771,8 @@ class TestFastPath:
     def test_fast_path_falls_back_on_failure(self, mock_enabled, temp_home, monkeypatch):
         """
         When _get_fast_path returns None (unavailable), _on_pre_llm_call
-        should fall through to _list_completed_dreams. The temp dir is empty
-        so no dreams are injected.
+        should fall through and call _list_completed_dreams with the extracted topic hints.
+        Since the temp dir is empty, result will be None.
         """
         import dream_auto.__init__ as dma
         monkeypatch.setenv("HOME", str(temp_home))
@@ -735,4 +789,5 @@ class TestFastPath:
                     session_id="fp_fallback",
                 )
                 mock_list.assert_called_once()
-                assert result is None  # no dreams in temp dir → nothing injected
+                # Result is None because no dreams in temp directory
+                assert result is None
