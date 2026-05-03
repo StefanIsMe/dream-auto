@@ -1,5 +1,5 @@
 name: dream_auto
-version: "3.3.0"
+version: "3.4.0"
 description: |
   Dream System v3 Plugin — MCTS background reasoning engine.
 
@@ -9,12 +9,18 @@ description: |
     - Scheduler decides when to start dreams based on resource availability
 
   Hook breakdown:
-    - pre_llm_call: inject completed dream insights (fast, global throttle + topic pre-filter)
+    - pre_llm_call: BM25-scored dream insight injection (topic-matched KC) + global throttle
     - pre_tool_call: suggest dreaming on complex execute_code (fast, no LLM call)
     - post_tool_call: error-triggered dream enqueue with expanded error signals (fast)
     - post_llm_call: throttled complex-question enqueue — checks every N turns (default 5)
     - on_session_start: lightweight session tracking cleanup (no DREAM_DIR scan)
     - on_session_end: clean up session state (fast)
+
+  BM25 scoring (pre_llm_call):
+    - rank-bm25 used when available (pure Python, no native deps — macOS/Linux/Windows WSL)
+    - graceful word-overlap fallback if rank-bm25 not installed
+    - mtime-based index cache invalidation — no rebuild on every call
+    - replaces hardcoded topic-keyword matching for dream selection
 
   Env vars:
     DREAM_AUTO_ENABLED=1             — disable entirely

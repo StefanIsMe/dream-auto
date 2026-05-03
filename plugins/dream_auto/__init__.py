@@ -30,6 +30,34 @@ from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+# ── BM25 (optional dependency, graceful fallback) ────────────────────────────
+# rank-bm25 is pure Python, no native deps — works on macOS/Linux/Windows WSL.
+# Fallback: simple word-overlap scorer if not installed.
+_bm25_available: bool = False
+_bm25_impl = None
+
+def _get_bm25():
+    """
+    Lazily import rank-bm25. Returns (scorer_func, is_bm25) tuple.
+
+    Cached via _bm25_impl — call _reset_bm25() to force re-import.
+    """
+    global _bm25_available, _bm25_impl
+    if _bm25_impl is not None:
+        return _bm25_impl
+
+    _bm25_available = False
+    _bm25_impl = (None, False)
+    try:
+        from rank_bm25 import BM25Okapi
+        _bm25_available = True
+        _bm25_impl = (BM25Okapi, True)
+        logger.debug("dream_auto: rank-bm25 available — using BM25 scoring")
+    except ImportError:
+        logger.debug("dream_auto: rank-bm25 not installed — using word-overlap fallback")
+
+    return _bm25_impl
+
 # ── Config ────────────────────────────────────────────────────────────────────
 ENABLED_ENV          = "DREAM_AUTO_ENABLED"
 VERBOSE_ENV          = "DREAM_AUTO_VERBOSE"
@@ -46,6 +74,130 @@ KNOWLEDGE_CACHE_DB   = Path.home() / ".hermes" / "state" / "dream" / "knowledge_
 _session_injected:       Dict[str, Set[str]] = {}  # session_id → set of dream_ids
 _session_turn_counter:   Dict[str, int]    = {}  # session_id → turn count since last dream check
 _last_global_hook_ts:    float             = -300.0  # sentinel: -300 so first call always passes
+
+# ── BM25 index cache (mtime-invalidated) ─────────────────────────────────────
+_bm25_index = None            # built index (BM25 instance or fallback tokenized list)
+_bm25_dreams = []            # list of dream dicts matching the index (same order)
+_bm25_dir_mtime: float = -1.0  # DREAM_DIR mtime when index was built
+_bm25_is_real: bool = False    # True only when _bm25_index is a real BM25 instance
+
+def _tokenize(text: str) -> List[str]:
+    """Simple whitespace tokenizer used by both BM25 and fallback."""
+    return text.lower().split()
+
+def _build_bm25_index(dreams: List[dict]):
+    """Build (or rebuild) the BM25 index from a list of dream dicts."""
+    global _bm25_index, _bm25_dreams, _bm25_dir_mtime
+
+    if not dreams:
+        _bm25_index = None
+        _bm25_dreams = []
+        _bm25_dir_mtime = -1.0
+        return
+
+    _bm25_dreams = dreams
+    tokenized = [_tokenize(d["brief"]) for d in dreams]
+
+    bm25_cls, is_bm25 = _get_bm25()
+    if is_bm25 and bm25_cls is not None:
+        try:
+            _bm25_index = bm25_cls(tokenized)
+            _bm25_is_real = True
+        except Exception as e:
+            # Guard against: ZeroDivisionError (singleton corpus with unique terms),
+            # import errors, or any other rank-bm25 edge case.
+            # Fall back to tokenized corpus for word-overlap scoring.
+            logger.debug(f"dream_auto: BM25 index build failed ({e}) — using word-overlap fallback")
+            _bm25_index = tokenized
+            _bm25_is_real = False
+    else:
+        # rank-bm25 not available — word-overlap fallback
+        _bm25_index = tokenized
+        _bm25_is_real = False
+
+    # Record mtime after building so any new dream created during build
+    # correctly triggers a rebuild on next call
+    try:
+        _bm25_dir_mtime = DREAM_DIR.stat().st_mtime if DREAM_DIR.exists() else -1.0
+    except OSError:
+        _bm25_dir_mtime = -1.0
+
+def _score_dreams_bm25(user_message: str, max_inject: int) -> List[dict]:
+    """
+    Score completed dreams against user_message using BM25 (or word-overlap fallback).
+    Returns up to `max_inject` dreams sorted by relevance score, with
+    session dedup handled separately by the caller.
+    """
+    global _bm25_index, _bm25_dreams, _bm25_dir_mtime
+
+    if not _bm25_dreams:
+        return []
+
+    user_tokens = _tokenize(user_message)
+    if not user_tokens:
+        return []
+
+    if _bm25_is_real and _bm25_index is not None:
+        # BM25 path: score all docs, take top-k
+        scores = _bm25_index.get_scores(user_tokens)
+        for d, s in zip(_bm25_dreams, scores):
+            d["_score"] = s
+    else:
+        # Fallback word-overlap: TF-based Jaccard-ish score
+        user_set = set(user_tokens)
+        user_len = len(user_set)
+        for d in _bm25_dreams:
+            doc_tokens = set(_tokenize(d["brief"]))
+            overlap = len(user_set & doc_tokens)
+            d["_score"] = overlap / user_len if user_len else 0
+
+    # Filter to minimum threshold and sort
+    scored = [d for d in _bm25_dreams if d.get("_score", 0) > 0]
+    scored.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    return scored[:max_inject]
+
+def _refresh_bm25_index_if_needed():
+    """Invalidate and rebuild BM25 index if DREAM_DIR has changed."""
+    global _bm25_dir_mtime
+    try:
+        current_mtime = DREAM_DIR.stat().st_mtime if DREAM_DIR.exists() else -1.0
+    except OSError:
+        current_mtime = -1.0
+
+    if current_mtime != _bm25_dir_mtime:
+        # Re-scan completed dreams and rebuild index
+        all_dreams = _list_completed_dreams_raw()  # no topic filter, just done+has_content
+        _build_bm25_index(all_dreams)
+
+def _list_completed_dreams_raw() -> List[dict]:
+    """List all completed dreams that have non-empty insights or questions.
+    No topic filtering — used to build the BM25 corpus.
+    """
+    if not DREAM_DIR.exists():
+        return []
+
+    dreams = []
+    for dream_path in sorted(DREAM_DIR.iterdir(), reverse=True):
+        if not dream_path.is_dir():
+            continue
+        meta = _read_json(dream_path / "meta.json", {})
+        if meta.get("status") not in _STATUS_DONE:
+            continue
+        if not _has_insights_or_questions(dream_path.name):
+            continue
+
+        confidence = meta.get("best_confidence", meta.get("confidence", 0.0))
+        ended_at = meta.get("ended_at", meta.get("started_at", ""))
+        dreams.append({
+            "id": dream_path.name,
+            "brief": meta.get("brief", "")[:200],
+            "confidence": confidence,
+            "topics": meta.get("topics", []),
+            "_ended_at": ended_at,
+        })
+
+    dreams.sort(key=lambda d: (d["confidence"], d.get("_ended_at", "")), reverse=True)
+    return dreams
 
 # ── Cached fast_path import (avoid re-import on every hook call) ───────────────
 _fast_path_module = None
@@ -485,8 +637,8 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
-    logger.info("dream_auto v3.1: registered 6 hooks — global throttle, topic pre-filter, "
-                "dedup queue, expanded error signals, configurable KC TTL")
+    logger.info("dream_auto v3.4: registered 6 hooks — BM25 scoring, mtime index cache, "
+                "global throttle, topic-matched KC, configurable KC TTL")
 
 
 def _on_pre_llm_call(
@@ -504,9 +656,9 @@ def _on_pre_llm_call(
     FAST PATH: skip all work for trivially simple queries.
 
     Global throttle: skip this hook if it ran less than N seconds ago.
-    Topic pre-filtering: extract topic hints from user message, pre-filter
-    completed dreams before calling _distill_insights (avoids wasted LLM-call
-    time on dreams that don't match the current topic).
+    BM25 scoring: completed dreams are ranked by BM25 against the user message
+    (with graceful word-overlap fallback if rank-bm25 is not installed).
+    Knowledge cache entries are still topic-hinted for pre-filtering.
     """
     global _last_global_hook_ts
 
@@ -532,11 +684,31 @@ def _on_pre_llm_call(
         except Exception:
             pass  # fast_path failed — proceed with normal path
 
-    # ── Topic hints: extract from user message for pre-filtering ─────────────
+    # ── BM25: refresh index if needed, then score dreams ───────────────────────
+    _refresh_bm25_index_if_needed()
+    scored_dreams = _score_dreams_bm25(user_message, _max_inject())
+
+    # ── Session deduplication ───────────────────────────────────────────────────
+    injected = _session_injected.get(session_id, set())
+
+    parts = []
+    for dream in scored_dreams:
+        if dream["id"] in injected:
+            continue
+        distilled = _distill_insights(dream["id"])
+        if distilled:
+            parts.append(distilled)
+            injected.add(dream["id"])
+
+    if session_id:
+        _session_injected[session_id] = injected
+
+    # ── Knowledge cache: still use topic hints for pre-filtering ───────────────
+    # (the KC stores entries with topic tags, so we keep that matching)
     _topic_keywords = {
         "linkedin": ["linkedin", "li_at", "org2", "social post", "engagement"],
         "research": ["research", "arxiv", "paper", "study", "academic"],
-        "coding": ["python", "javascript", "typescript", "rust", "debug", "api", "coding"],
+        "coding": ["python", "javascript", "typescript", "rust", "debug", "api"],
         "browser": ["chrome", "cdp", "selenium", "scraper", "camoufox", "browser"],
         "database": ["sqlite", "postgres", "sql", "db", "query", "database"],
         "hermes": ["hermes", "agent", "cron", "plugin", "hook", "delegate"],
@@ -548,23 +720,6 @@ def _on_pre_llm_call(
     msg_lower = user_message.lower()
     topic_hints = [t for t, kws in _topic_keywords.items() if any(kw in msg_lower for kw in kws)]
 
-    parts = []
-    completed = _list_completed_dreams(topic_hints=topic_hints)
-    injected = _session_injected.get(session_id, set())
-
-    for dream in completed[:_max_inject()]:
-        if dream["id"] in injected:
-            continue
-
-        distilled = _distill_insights(dream["id"])
-        if distilled:
-            parts.append(distilled)
-            injected.add(dream["id"])
-
-    if session_id:
-        _session_injected[session_id] = injected
-
-    # ── Knowledge cache: predictive pre-warmed context ────────────────────────
     knowledge_entries = _read_knowledge_cache(topic_hints=topic_hints, limit=2, session_id=session_id)
     if knowledge_entries:
         parts.append("[KNOWLEDGE CACHE — pre-warmed from session index]\n" +
