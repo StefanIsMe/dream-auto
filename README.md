@@ -52,13 +52,14 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
                       │              dream_auto Plugin               │
                       │  (6 hooks: pre_llm, suggest, post_tool,      │
                       │   post_llm, session_start, session_end)        │
-                      └──────────────────────┬───────────────────────┘
-                                             │ queues dreams
-                                             ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ Session Indexer │────▶│ Session Grader  │────▶│  Dream Queue   │
-│   (every 6h)   │     │  (LLM scores)   │     │   (SQLite)     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+                     └──────────────────────┬───────────────────────┘
+                                            │ queues dreams
+                                            ▼
+┌─────────────────────────┐  ┌──────────────────────────────┐  ┌─────────────────┐
+│  Dream Pipeline         │──▶│  Dream Queue               │──▶│  Scheduler      │
+│  (every 2h, merged      │  │  (SQLite)                  │  │  (every 30min)  │
+│   indexer + grader)     │  └──────────────────────────────┘  └─────────────────┘
+└─────────────────────────┘
                                                        │
                                                        ▼
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -81,8 +82,8 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
               injects insights
 ```
 
-- **Session Indexer** scans `~/.hermes/sessions/` for transcripts, extracts topics, errors, and open questions
-- **Session Grader** asks an LLM: "How much would dreaming about this session help future conversations?"
+- **Dream Pipeline** runs every 2h: scans `~/.hermes/sessions/` for new transcripts, extracts topics/errors/open-questions, then grades each session using a 5-dimension LLM rubric (systemic value 30%, deferred depth 25%, reasoning novelty 20%, actionability 15%, error quality 10%). Threshold: >= 0.70 worth dreaming, < 0.30 skip.
+
 - **Scheduler** checks resources (CPU < 70%, RAM < 70%) and picks the highest-priority queued dream (with wallclock killer)
 - **MCTS Engine v3** runs Monte Carlo Tree Search with UCB1-Tuned selection, parallel rollouts
 - **Tier 1** (always): fast LLM-only reasoning via `hermes chat -q`, ~1-2s
@@ -250,8 +251,7 @@ dream-auto/
 ├── scripts/
 │   ├── dream_scheduler.py         # Queue manager + wallclock killer
 │   ├── dream_insights_dashboard.py # CLI dashboard
-│   ├── session_indexer.py          # Session scanner + grader
-│   ├── session_grader.py           # LLM-based potential scorer
+│   ├── dream_pipeline.py            # Merged session indexer + grader (v2 rubric)
 │   └── dream_loop_v3.py            # MCTS engine (also in skills/)
 └── skills/
     └── autonomous-ai-agents/

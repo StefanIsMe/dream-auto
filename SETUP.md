@@ -101,8 +101,7 @@ cp -r "$DREAM_AUTO_REPO/plugins/dream_auto" "$HERMES_HOME/plugins/"
 # Copy all scripts
 cp "$DREAM_AUTO_REPO/scripts/dream_scheduler.py" "$HERMES_HOME/scripts/"
 cp "$DREAM_AUTO_REPO/scripts/dream_insights_dashboard.py" "$HERMES_HOME/scripts/"
-cp "$DREAM_AUTO_REPO/scripts/session_indexer.py" "$HERMES_HOME/scripts/"
-cp "$DREAM_AUTO_REPO/scripts/session_grader.py" "$HERMES_HOME/scripts/"
+cp "$DREAM_AUTO_REPO/scripts/dream_pipeline.py" "$HERMES_HOME/scripts/"
 
 # Copy skills (MCTS engine + fast_path分流)
 cp -r "$DREAM_AUTO_REPO/skills/autonomous-ai-agents/hermes-dream-task" \
@@ -250,14 +249,14 @@ read -p "Select [1/2/3]: " CRON_CHOICE
 if [ "$CRON_CHOICE" = "1" ]; then
     # Recommended defaults
     SCHEDULER_CRON="*/30 * * * *"
-    INDEXER_CRON="0 */6 * * *"
-    echo "Scheduler: every 30 min | Indexer: every 6h"
+    PIPELINE_CRON="0 */2 * * *"
+    echo "Scheduler: every 30 min | Pipeline: every 2h"
 
 elif [ "$CRON_CHOICE" = "2" ]; then
     echo "Enter dream-scheduler cron expression (e.g. */30 * * * *):"
     read SCHEDULER_CRON
-    echo "Enter session-indexer cron expression (e.g. 0 */6 * * *):"
-    read INDEXER_CRON
+    echo "Enter dream-pipeline cron expression (e.g. 0 */2 * * *):"
+    read PIPELINE_CRON
 
 elif [ "$CRON_CHOICE" = "3" ]; then
     echo "Analyzing your Hermes session history for optimal quiet hours..."
@@ -267,23 +266,23 @@ elif [ "$CRON_CHOICE" = "3" ]; then
 Find the typical active hours and idle/quiet windows. \
 Recommend cron schedules that minimise interference with the user's active work. \
 The dream-scheduler ideally runs every 30 minutes. \
-The session-indexer ideally runs every 6 hours. \
+The dream-pipeline (indexer + grader) ideally runs every 2 hours. \
 Output ONLY this exact format, nothing else: \
-SCHEDULER=<cron_expr> INDEXER=<cron_expr>" 2>/dev/null)
+SCHEDULER=<cron_expr> PIPELINE=<cron_expr>" 2>/dev/null)
     SCHEDULER_CRON=$(echo "$RECOMMENDATION" | grep -oP 'SCHEDULER=\K[^ ]+')
-    INDEXER_CRON=$(echo "$RECOMMENDATION" | grep -oP 'INDEXER=\K[^ ]+')
-    echo "Auto-detected — Scheduler: $SCHEDULER_CRON | Indexer: $INDEXER_CRON"
+    PIPELINE_CRON=$(echo "$RECOMMENDATION" | grep -oP 'PIPELINE=\K[^ ]+')
+    echo "Auto-detected — Scheduler: $SCHEDULER_CRON | Pipeline: $PIPELINE_CRON"
 
     # Fallback if LLM returns nothing useful
-    if [ -z "$SCHEDULER_CRON" ] || [ -z "$INDEXER_CRON" ]; then
+    if [ -z "$SCHEDULER_CRON" ] || [ -z "$PIPELINE_CRON" ]; then
         echo "WARNING: Could not determine optimal schedule. Using recommended defaults."
         SCHEDULER_CRON="*/30 * * * *"
-        INDEXER_CRON="0 */6 * * *"
+        PIPELINE_CRON="0 */2 * * *"
     fi
 else
     echo "Invalid choice. Using recommended defaults."
     SCHEDULER_CRON="*/30 * * * *"
-    INDEXER_CRON="0 */6 * * *"
+    PIPELINE_CRON="0 */2 * * *"
 fi
 
 # Register dream-scheduler
@@ -293,12 +292,12 @@ fi
     "Run the Dream Auto scheduler." \
     2>/dev/null || echo "dream-scheduler cron already registered (skipping)"
 
-# Register session-indexer
-"$HERMES_BIN" cron create "$INDEXER_CRON" \
-    --name "session-indexer" \
-    --script "session_indexer.py" \
-    "Run the Dream Auto session indexer." \
-    2>/dev/null || echo "session-indexer cron already registered (skipping)"
+# Register dream-pipeline (merged indexer + grader)
+"$HERMES_BIN" cron create "$PIPELINE_CRON" \
+    --name "dream-pipeline" \
+    --script "dream_pipeline.py" \
+    "Run the Dream Pipeline — merged session indexer + grader." \
+    2>/dev/null || echo "dream-pipeline cron already registered (skipping)"
 ```
 
 ---
@@ -322,7 +321,7 @@ export DREAM_AUTO_MAX_INJECT=3
 ### STEP 9 — First Run: Populate Session Index
 
 ```bash
-"$HERMES_PY" "$HERMES_HOME/scripts/session_indexer.py" --limit 50
+"$HERMES_PY" "$HERMES_HOME/scripts/dream_pipeline.py" --index-only
 ```
 
 ---
@@ -338,8 +337,7 @@ ls "$HERMES_HOME/plugins/dream_auto/resource_monitor.py"
 echo "=== Scripts ==="
 ls "$HERMES_HOME/scripts/dream_scheduler.py"
 ls "$HERMES_HOME/scripts/dream_insights_dashboard.py"
-ls "$HERMES_HOME/scripts/session_indexer.py"
-ls "$HERMES_HOME/scripts/session_grader.py"
+ls "$HERMES_HOME/scripts/dream_pipeline.py"
 
 echo "=== Skills ==="
 ls "$HERMES_HOME/skills/autonomous-ai-agents/hermes-dream-task/scripts/dream_loop_v3.py"
@@ -409,8 +407,7 @@ dream-auto/
 ├── scripts/
 │   ├── dream_scheduler.py         # Queue manager + wallclock killer
 │   ├── dream_insights_dashboard.py # CLI dashboard
-│   ├── session_indexer.py         # Session scanner + grader
-│   ├── session_grader.py           # LLM-based potential scorer
+│   ├── dream_pipeline.py            # Merged session indexer + grader (v2 rubric)
 │   └── dream_loop_v3.py            # MCTS engine v3 (also in skills/)
 └── skills/
     └── autonomous-ai-agents/
@@ -435,7 +432,7 @@ dream-auto/
 | `psutil` install fails | `sudo dnf install python3-devel` (Fedora) or `sudo apt install python3-dev` (Debian/Ubuntu) or `xcode-select --install` (macOS) |
 | `dream-dashboard` not found | `~/.local/bin` not in PATH. Use `$HERMES_PY ~/.hermes/scripts/dream_insights_dashboard.py` instead |
 | Cron jobs not firing | Run `$HERMES_BIN gateway start` |
-| Dashboard shows no sessions | Run `$HERMES_PY ~/.hermes/scripts/session_indexer.py --limit 50` manually |
+| Dashboard shows no sessions | Run `$HERMES_PY ~/.hermes/scripts/dream_pipeline.py --index-only` to populate the session index |
 | Dreams never start | Check resources: CPU must be < 70% AND RAM < 70% for scheduler to start dreams |
 | Queue shows dreams stuck "running" | Run `$HERMES_PY ~/.hermes/scripts/dream_scheduler.py` once manually — the completion-detection fix (v3.0.1) syncs them |
 | Upgrade: old files persist | Run Step 4 again — the `rm -rf` before each `cp` ensures clean overwrite |
