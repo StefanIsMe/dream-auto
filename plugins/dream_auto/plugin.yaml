@@ -9,7 +9,7 @@ description: |
     - Scheduler decides when to start dreams based on resource availability
 
   Hook breakdown:
-    - pre_llm_call: BM25-scored dream insight injection (topic-matched KC) + global throttle
+    - pre_llm_call: BM25-scored dream insight injection + global throttle
     - pre_tool_call: suggest dreaming on complex execute_code (fast, no LLM call)
     - post_tool_call: error-triggered dream enqueue with expanded error signals (fast)
     - post_llm_call: throttled complex-question enqueue — checks every N turns (default 5)
@@ -20,7 +20,7 @@ description: |
     - rank-bm25 used when available (pure Python, no native deps — macOS/Linux/Windows WSL)
     - graceful word-overlap fallback if rank-bm25 not installed
     - mtime-based index cache invalidation — no rebuild on every call
-    - replaces hardcoded topic-keyword matching for dream selection
+    - scores ALL completed dreams against ANY prompt — no topic filtering needed
 
   Env vars:
     DREAM_AUTO_ENABLED=1             — disable entirely
@@ -28,7 +28,6 @@ description: |
     DREAM_AUTO_MAX_INJECT=3          — max dreams to inject per turn (default 3)
     DREAM_AUTO_THROTTLE_TURNS=5      — post_llm_call fires at most every N turns (default 5)
     DREAM_AUTO_GLOBAL_THROTTLE=300   — skip pre_llm_call if ran < N seconds ago (default 300)
-    DREAM_AUTO_KNOWLEDGE_CACHE_TTL_DAYS=7 — knowledge cache TTL (default 7 days)
 
 provides_hooks:
   - pre_llm_call

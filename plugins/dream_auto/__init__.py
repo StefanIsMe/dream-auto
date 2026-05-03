@@ -64,12 +64,10 @@ VERBOSE_ENV          = "DREAM_AUTO_VERBOSE"
 MAX_INJECT_ENV       = "DREAM_AUTO_MAX_INJECT"
 THROTTLE_ENV         = "DREAM_AUTO_THROTTLE_TURNS"
 GLOBAL_THROTTLE_ENV  = "DREAM_AUTO_GLOBAL_THROTTLE"
-KC_TTL_ENV           = "DREAM_AUTO_KNOWLEDGE_CACHE_TTL_DAYS"
 
 GMT7 = timezone(timedelta(hours=7))
 DREAM_DIR            = Path.home() / ".hermes" / "state" / "dream"
 DREAM_QUEUE_DB       = Path.home() / ".hermes" / "state" / "dream" / "dream_queue.db"
-KNOWLEDGE_CACHE_DB   = Path.home() / ".hermes" / "state" / "dream" / "knowledge_cache.db"
 
 _session_injected:       Dict[str, Set[str]] = {}  # session_id → set of dream_ids
 _session_turn_counter:   Dict[str, int]    = {}  # session_id → turn count since last dream check
@@ -241,14 +239,6 @@ def _global_throttle_seconds() -> int:
     except ValueError:
         return 300
 
-def _knowledge_cache_ttl_days() -> int:
-    """TTL in days for knowledge cache entries (default 7)."""
-    try:
-        return int(os.environ.get(KC_TTL_ENV, "7"))
-    except ValueError:
-        return 7
-
-
 # ── Done-status normalization ─────────────────────────────────────────────────
 
 # v3 meta.json uses non-standard status values. Normalize everything here.
@@ -303,79 +293,7 @@ def _read_pending_questions(dream_id: str) -> List[str]:
         return []
 
 
-def _read_knowledge_cache(topic_hints: list[str] = None, limit: int = 3, session_id: str = None) -> List[str]:
-    """
-    Read entries from the predictive knowledge cache.
-    Returns up to `limit` formatted entries, filtered by topic hints if provided.
-    Tracks which sessions have been injected to avoid re-injecting.
-    """
-    if not KNOWLEDGE_CACHE_DB.exists():
-        return []
-
-    try:
-        import sqlite3
-        conn = sqlite3.connect(str(KNOWLEDGE_CACHE_DB))
-        # Ensure indexes exist for query efficiency
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_topic_cached ON knowledge_cache(topic, cached_at DESC)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_cached ON knowledge_cache(cached_at DESC)")
-        except Exception:
-            pass
-
-        # Configurable TTL — skip entries older than this
-        ttl_days = _knowledge_cache_ttl_days()
-        age_cutoff = (datetime.now(GMT7) - timedelta(days=ttl_days)).isoformat()
-
-        if topic_hints:
-            # Match entries by topic, most recent first, within TTL
-            placeholders = ",".join(["?"] * len(topic_hints))
-            rows = conn.execute(f"""
-                SELECT content, source, topic, cached_at, injected_sessions, content_hash
-                FROM knowledge_cache
-                WHERE topic IN ({placeholders})
-                AND cached_at > ?
-                ORDER BY cached_at DESC
-                LIMIT ?
-            """, (*topic_hints, age_cutoff, limit * 2)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT content, source, topic, cached_at, injected_sessions, content_hash
-                FROM knowledge_cache
-                WHERE cached_at > ?
-                ORDER BY cached_at DESC
-                LIMIT ?
-            """, (age_cutoff, limit * 2)).fetchall()
-
-        conn.close()
-
-        results = []
-        seen_hashes = set()
-        for content, source, topic, cached_at, injected_sessions, content_hash in rows:
-            # Skip duplicates by content hash
-            if content_hash and content_hash in seen_hashes:
-                continue
-            seen_hashes.add(content_hash)
-
-            # Skip if this session already received this entry
-            if session_id and injected_sessions:
-                try:
-                    injected_list = json.loads(injected_sessions)
-                    if session_id in injected_list:
-                        continue
-                except Exception:
-                    pass
-
-            if len(results) >= limit:
-                break
-            results.append(f"[KNOWLEDGE CACHE — {source} — {topic}]\n{content[:500]}")
-
-        return results
-
-    except Exception:
-        return []
-
 def _has_insights_or_questions(dream_id: str) -> bool:
-    """True if dream has non-empty insights OR pending questions."""
     insights = _read_json(_dream_path(dream_id) / "insights.json", None)
     if insights and isinstance(insights, list) and len(insights) > 0:
         return True
@@ -637,8 +555,7 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
-    logger.info("dream_auto v3.4: registered 6 hooks — BM25 scoring, mtime index cache, "
-                "global throttle, topic-matched KC, configurable KC TTL")
+    logger.info("dream_auto v3.4: registered 6 hooks — BM25 scoring, mtime index cache, global throttle")
 
 
 def _on_pre_llm_call(
@@ -703,35 +620,13 @@ def _on_pre_llm_call(
     if session_id:
         _session_injected[session_id] = injected
 
-    # ── Knowledge cache: still use topic hints for pre-filtering ───────────────
-    # (the KC stores entries with topic tags, so we keep that matching)
-    _topic_keywords = {
-        "linkedin": ["linkedin", "li_at", "org2", "social post", "engagement"],
-        "research": ["research", "arxiv", "paper", "study", "academic"],
-        "coding": ["python", "javascript", "typescript", "rust", "debug", "api"],
-        "browser": ["chrome", "cdp", "selenium", "scraper", "camoufox", "browser"],
-        "database": ["sqlite", "postgres", "sql", "db", "query", "database"],
-        "hermes": ["hermes", "agent", "cron", "plugin", "hook", "delegate"],
-        "web": ["website", "seo", "cloudflare", "deployment", "http", "web"],
-        "vietnam": ["vietnam", "hcmc", "tay ninh", "vnd"],
-        "content": ["article", "blog", "writing", "seo", "content"],
-        "ai": ["llm", "gpt", "claude", "model", "ai", "inference"],
-    }
-    msg_lower = user_message.lower()
-    topic_hints = [t for t, kws in _topic_keywords.items() if any(kw in msg_lower for kw in kws)]
-
-    knowledge_entries = _read_knowledge_cache(topic_hints=topic_hints, limit=2, session_id=session_id)
-    if knowledge_entries:
-        parts.append("[KNOWLEDGE CACHE — pre-warmed from session index]\n" +
-                     "\n".join(knowledge_entries))
-
     if not parts:
         return None
 
     combined = "\n\n".join(parts)
 
     if _verbose():
-        logger.info(f"dream_auto v3 pre_llm_call: injected {len(combined)} chars from {len(parts)} dreams")
+        logger.info(f"dream_auto v3.4 pre_llm_call: injected {len(combined)} chars from {len(parts)} dreams")
 
     return {"context": combined}
 

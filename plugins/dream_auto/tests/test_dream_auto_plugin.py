@@ -72,8 +72,7 @@ def mock_enabled(temp_home):
     patched_dir = temp_home / ".hermes" / "state" / "dream"
     with patch.dict(os.environ, {"DREAM_AUTO_ENABLED": "1", "HOME": str(temp_home)}), \
          patch.object(dma, "DREAM_DIR", patched_dir), \
-         patch.object(dma, "DREAM_QUEUE_DB", patched_dir / "dream_queue.db"), \
-         patch.object(dma, "KNOWLEDGE_CACHE_DB", patched_dir / "knowledge_cache.db"):
+         patch.object(dma, "DREAM_QUEUE_DB", patched_dir / "dream_queue.db"):
         # Ensure the fake DREAM_DIR actually exists so code that checks .exists() works
         patched_dir.mkdir(parents=True, exist_ok=True)
         yield
@@ -85,7 +84,7 @@ def mock_disabled(temp_home):
     import dream_auto.__init__ as dma
     with patch.dict(os.environ, {"DREAM_AUTO_ENABLED": "0", "HOME": str(temp_home)}), \
          patch.object(dma, "DREAM_DIR", temp_home / ".hermes" / "state" / "dream"), \
-         patch.object(dma, "KNOWLEDGE_CACHE_DB", temp_home / ".hermes" / "state" / "dream" / "knowledge_cache.db"):
+         patch.object(dma, "DREAM_QUEUE_DB", temp_home / ".hermes" / "state" / "dream" / "dream_queue.db"):
         yield
 
 
@@ -779,41 +778,8 @@ class TestKnowledgeCache:
     """_read_knowledge_cache."""
 
     def test_returns_empty_when_disabled(self, mock_disabled, temp_home):
-        import dream_auto.__init__ as dma
-        result = dma._read_knowledge_cache(topic_hints=["linkedin"], limit=3)
-        assert result == []
-
-    def test_reads_from_knowledge_cache_db(self, mock_enabled, temp_home, monkeypatch):
-        import dream_auto.__init__ as dma
-        monkeypatch.setenv("HOME", str(temp_home))
-
-        kc_db = temp_home / ".hermes" / "state" / "dream" / "knowledge_cache.db"
-        kc_db.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(kc_db))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_cache (
-                id INTEGER PRIMARY KEY,
-                topic TEXT,
-                content TEXT,
-                source TEXT,
-                cached_at TEXT,
-                injected_sessions TEXT,
-                content_hash TEXT
-            )
-        """)
-        from datetime import datetime
-        GMT7 = timezone(timedelta(hours=7))
-        now = datetime.now(GMT7).isoformat()
-        conn.execute(
-            "INSERT INTO knowledge_cache (topic, content, source, cached_at, injected_sessions, content_hash) VALUES (?, ?, ?, ?, ?, ?)",
-            ("linkedin", "LinkedIn cron needs cookie refresh", "session_001", now, "[]", "abc123")
-        )
-        conn.commit()
-        conn.close()
-
-        result = dma._read_knowledge_cache(topic_hints=["linkedin"], limit=3)
-        assert len(result) >= 1
-        assert any("linkedin" in r.lower() for r in result)
+        # KC is removed — nothing to test here; kept as placeholder
+        pass
 
 
 # ── Fast-path bypass ──────────────────────────────────────────────────────────
@@ -1229,101 +1195,6 @@ class TestHasInsightsOrQuestions:
         assert dma._has_insights_or_questions(did) is True
 
 
-# ── Knowledge cache: TTL expiry ───────────────────────────────────────────────
-
-class TestKnowledgeCacheTTL:
-    """Entries older than _knowledge_cache_ttl_days() are excluded."""
-
-    def test_kc_skips_expired_entries(self, mock_enabled, temp_home, monkeypatch):
-        """An entry with cached_at older than TTL should not be returned."""
-        import dream_auto.__init__ as dma
-        monkeypatch.setenv("HOME", str(temp_home))
-        patched_kc = temp_home / ".hermes" / "state" / "dream" / "knowledge_cache.db"
-
-        import sqlite3
-        conn = sqlite3.connect(str(patched_kc))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_cache (
-                topic TEXT, content TEXT, source TEXT, cached_at TEXT,
-                injected_sessions TEXT, content_hash TEXT
-            )
-        """)
-        # Entry from 10 days ago — well beyond default TTL of 7
-        old_date = "2026-04-01T00:00:00+07:00"
-        conn.execute("""
-            INSERT INTO knowledge_cache
-                (topic, content, source, cached_at, injected_sessions, content_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, ("linkedin", "Old stale cached content.", "test", old_date, "[]", "hash_old"))
-        conn.commit()
-        conn.close()
-
-        with patch.object(dma, "KNOWLEDGE_CACHE_DB", patched_kc):
-            result = dma._read_knowledge_cache(topic_hints=["linkedin"], limit=3)
-            # Old entry should be outside TTL window
-            assert len(result) == 0
-
-    def test_kc_respects_custom_ttl(self, mock_enabled, temp_home, monkeypatch):
-        """DREAM_AUTO_KNOWLEDGE_CACHE_TTL_DAYS=0 should return no entries."""
-        import dream_auto.__init__ as dma
-        monkeypatch.setenv("HOME", str(temp_home))
-        monkeypatch.setenv("DREAM_AUTO_KNOWLEDGE_CACHE_TTL_DAYS", "0")
-        patched_kc = temp_home / ".hermes" / "state" / "dream" / "knowledge_cache.db"
-
-        import sqlite3
-        conn = sqlite3.connect(str(patched_kc))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_cache (
-                topic TEXT, content TEXT, source TEXT, cached_at TEXT,
-                injected_sessions TEXT, content_hash TEXT
-            )
-        """)
-        # Even a "now" entry should be excluded when TTL = 0
-        GMT7 = timezone(timedelta(hours=7))
-        now = datetime.now(GMT7).isoformat()
-        conn.execute("""
-            INSERT INTO knowledge_cache
-                (topic, content, source, cached_at, injected_sessions, content_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, ("hermes", "Fresh content.", "test", now, "[]", "hash_fresh"))
-        conn.commit()
-        conn.close()
-
-        with patch.object(dma, "KNOWLEDGE_CACHE_DB", patched_kc):
-            result = dma._read_knowledge_cache(topic_hints=["hermes"], limit=3)
-            # TTL=0 means cutoff is "now" — nothing qualifies
-            assert len(result) == 0
-
-    def test_kc_session_dedup_prevents_reinject(self, mock_enabled, temp_home, monkeypatch):
-        """An entry already injected to the current session_id is skipped."""
-        import dream_auto.__init__ as dma
-        monkeypatch.setenv("HOME", str(temp_home))
-        patched_kc = temp_home / ".hermes" / "state" / "dream" / "knowledge_cache.db"
-
-        import sqlite3
-        conn = sqlite3.connect(str(patched_kc))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_cache (
-                topic TEXT, content TEXT, source TEXT, cached_at TEXT,
-                injected_sessions TEXT, content_hash TEXT
-            )
-        """)
-        GMT7 = timezone(timedelta(hours=7))
-        now = datetime.now(GMT7).isoformat()
-        # Entry already lists "dedup_test_sid" in injected_sessions
-        conn.execute("""
-            INSERT INTO knowledge_cache
-                (topic, content, source, cached_at, injected_sessions, content_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, ("ai", "Model inference speed analysis.", "session_001", now,
-               '["dedup_test_sid"]', "hash_dedup"))
-        conn.commit()
-        conn.close()
-
-        with patch.object(dma, "KNOWLEDGE_CACHE_DB", patched_kc):
-            result = dma._read_knowledge_cache(topic_hints=["ai"], limit=3, session_id="dedup_test_sid")
-            assert len(result) == 0  # Entry was skipped because this session already received it
-
 
 # ── Done-status normalization ─────────────────────────────────────────────────
 
@@ -1439,103 +1310,3 @@ class TestBM25Fallback:
             # Should have fallen back to tokenized list with _bm25_is_real=False
             assert dma._bm25_is_real is False
             assert dma._bm25_index is not None  # fallback corpus still stored
-
-
-# ── pre_llm_call: BM25 injection with knowledge cache ───────────────────────
-
-class TestPreLlmCallWithKnowledgeCache:
-    """pre_llm_call combines dream insights AND knowledge cache entries in one context."""
-
-    def test_kc_and_dream_insights_both_injected(self, mock_enabled, temp_home, monkeypatch):
-        """When both dreams and KC entries match, both appear in the returned context."""
-        import dream_auto.__init__ as dma
-        monkeypatch.setenv("HOME", str(temp_home))
-        dream_path = temp_home / ".hermes" / "state" / "dream"
-        dream_path.mkdir(parents=True, exist_ok=True)
-        patched_kc = dream_path / "knowledge_cache.db"
-        patched_dir = dream_path
-
-        # Create a completed dream about LinkedIn
-        did = "li_dream"
-        dp = dream_path / did
-        dp.mkdir()
-        (dp / "meta.json").write_text(json.dumps({
-            "status": "done",
-            "confidence": 0.82,
-            "brief": "linkedin cookie auth failure",
-        }))
-        (dp / "insights.json").write_text(json.dumps(["Li_at cookie expires after 6 hours."]))
-
-        # Populate knowledge cache with a matching entry
-        import sqlite3
-        GMT7 = timezone(timedelta(hours=7))
-        conn = sqlite3.connect(str(patched_kc))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_cache (
-                topic TEXT, content TEXT, source TEXT, cached_at TEXT,
-                injected_sessions TEXT, content_hash TEXT
-            )
-        """)
-        conn.execute("""
-            INSERT INTO knowledge_cache
-                (topic, content, source, cached_at, injected_sessions, content_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, ("linkedin", "Cookie TTL is approximately 6 hours of active use.",
-               "session_indexer", datetime.now(GMT7).isoformat(), "[]", "hash_li_kc"))
-        conn.commit()
-        conn.close()
-
-        with patch.object(dma, "DREAM_DIR", patched_dir), \
-             patch.object(dma, "KNOWLEDGE_CACHE_DB", patched_kc):
-            dma._session_injected.clear()
-            dma._session_turn_counter.clear()
-            dma._last_global_hook_ts = -300.0
-
-            result = dma._on_pre_llm_call(
-                user_message="LinkedIn poster cron job keeps failing with auth errors",
-                conversation_history=[],
-                is_first_turn=False,
-                model="test",
-                platform="test",
-                session_id="kc_combined_test",
-            )
-
-        assert result is not None
-        # Both dream insight and KC entry should appear
-        assert "DREAM INSIGHTS" in result["context"]
-        assert "KNOWLEDGE CACHE" in result["context"]
-        assert "li_at cookie expires" in result["context"].lower() or "6 hours" in result["context"].lower()
-        assert "Cookie TTL" in result["context"]
-
-    def test_kc_filtered_by_topic_hints_not_bm25(self, mock_enabled, temp_home, monkeypatch):
-        """KC entries are still filtered by topic hints, not BM25 scores."""
-        import dream_auto.__init__ as dma
-        monkeypatch.setenv("HOME", str(temp_home))
-        dream_path = temp_home / ".hermes" / "state" / "dream"
-        dream_path.mkdir(parents=True, exist_ok=True)
-        patched_kc = dream_path / "knowledge_cache.db"
-
-        # KC entry about hermes (not linkedin)
-        import sqlite3
-        GMT7 = timezone(timedelta(hours=7))
-        conn = sqlite3.connect(str(patched_kc))
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_cache (
-                topic TEXT, content TEXT, source TEXT, cached_at TEXT,
-                injected_sessions TEXT, content_hash TEXT
-            )
-        """)
-        conn.execute("""
-            INSERT INTO knowledge_cache
-                (topic, content, source, cached_at, injected_sessions, content_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, ("hermes", "Hermes cron scheduler uses adaptive cadence.", "session_indexer",
-               datetime.now(GMT7).isoformat(), "[]", "hash_hermes_kc"))
-        conn.commit()
-        conn.close()
-
-        with patch.object(dma, "KNOWLEDGE_CACHE_DB", patched_kc):
-            # No linkedin-related topic hints in the message
-            result = dma._read_knowledge_cache(topic_hints=["linkedin"], limit=3, session_id="kc_filter_test")
-            assert len(result) == 0  # hermes topic doesn't match linkedin hint
-
