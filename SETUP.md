@@ -1,8 +1,8 @@
-# Dream Auto v3.3 — Setup Guide
+# Dream Auto v3.4 — Setup Guide
 
 **For:** Hermes Agent (or any AI assistant with terminal/file access)
 **Repo:** https://github.com/StefanIsMe/dream-auto
-**Version:** 3.3
+**Version:** 3.4
 
 ---
 
@@ -159,23 +159,6 @@ DB_SCHEMAS = {
             "CREATE INDEX IF NOT EXISTS idx_queue_dream_id       ON dream_queue(dream_id)",
         ],
     },
-    "knowledge_cache.db": {
-        "tables": """
-            CREATE TABLE IF NOT EXISTS dream_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                topic TEXT,
-                content TEXT,
-                source TEXT,
-                content_hash TEXT UNIQUE,
-                cached_at TEXT,
-                injected_sessions TEXT DEFAULT '[]'
-            );
-        """,
-        "indexes": [
-            "CREATE INDEX IF NOT EXISTS idx_dream_cache_topic     ON dream_cache(topic, cached_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_dream_cache_cached    ON dream_cache(cached_at DESC)",
-        ],
-    },
 }
 
 for db_name, schema in DB_SCHEMAS.items():
@@ -227,7 +210,7 @@ chmod +x "$HOME/.local/bin/dream-dashboard"
 
 Dream Auto needs two recurring jobs:
 - **dream-scheduler** — picks the highest-priority queued dream and starts it (every 30 min)
-- **session-indexer** — scans recent Hermes sessions and grades them for dream potential (every 6h)
+- **dream-pipeline** — scans recent Hermes sessions and grades them for dream potential (every 2h)
 
 Choose how to schedule them:
 
@@ -235,7 +218,7 @@ Choose how to schedule them:
 echo "=== Dream Auto Cron Scheduling ==="
 echo "How should the background jobs be scheduled?"
 echo ""
-echo "  [1] Recommended  — scheduler every 30 min, indexer every 6h"
+echo "  [1] Recommended  — scheduler every 30 min, pipeline every 2h"
 echo "                    (low resource impact, good for most users)"
 echo ""
 echo "  [2] Custom      — specify your own cron expressions"
@@ -347,13 +330,12 @@ ls "$HERMES_HOME/skills/ops/dream-system-v3/SKILL.md"
 echo "=== Databases ==="
 ls "$HERMES_HOME/state/dream/session_index.db"
 ls "$HERMES_HOME/state/dream/dream_queue.db"
-ls "$HERMES_HOME/state/dream/knowledge_cache.db"
 
 echo "=== Dashboard ==="
 "$HERMES_PY" "$HERMES_HOME/scripts/dream_insights_dashboard.py" --dry-run 2>/dev/null && echo "dashboard: OK" || echo "dashboard: FAILED"
 
 echo "=== Cron jobs ==="
-"$HERMES_BIN" cron list 2>/dev/null | grep -E "dream-scheduler|session-indexer"
+"$HERMES_BIN" cron list 2>/dev/null | grep -E "dream-scheduler|dream-pipeline"
 ```
 
 If all paths respond without error, Dream Auto is installed.
@@ -407,13 +389,15 @@ dream-auto/
 ├── scripts/
 │   ├── dream_scheduler.py         # Queue manager + wallclock killer
 │   ├── dream_insights_dashboard.py # CLI dashboard
-│   ├── dream_pipeline.py            # Merged session indexer + grader (v2 rubric)
+│   ├── dream_pipeline.py          # Merged session indexer + grader
+│   ├── backfill_knowledge_cache.py # [DEPRECATED] no-op, kept for compatibility
 │   └── dream_loop_v3.py            # MCTS engine v3 (also in skills/)
 └── skills/
     └── autonomous-ai-agents/
         └── hermes-dream-task/
             ├── SKILL.md
             └── scripts/
+                ├── dream_loop_v2.py  # legacy
                 ├── dream_loop_v3.py  # MCTS engine v3 — two-tier AIAgent
                 ├── fast_path.py       # Heuristic分流 (fast/slow path)
                 └── test_tool_rollouts.py
@@ -444,6 +428,7 @@ dream-auto/
 
 | Version | What changed |
 |---------|-------------|
+| 3.4     | **BM25 scoring + knowledge cache removed**: Dreams are now permanent (no TTL, no expiry). `rank-bm25` used when available for scoring; word-overlap fallback if not installed. `DREAM_AUTO_KNOWLEDGE_CACHE_TTL_DAYS` env var removed. `knowledge_cache.db` no longer created. MCTS engine runs in `skills/autonomous-ai-agents/hermes-dream-task/scripts/` (also symlinked in `scripts/`). |
 | 3.3     | **Insight injection bugs fixed**: `_STATUS_DONE` missing `completed_success` (434 dreams), `failed`, etc. — most completed dreams were silently skipped during insight injection. Added all missing statuses. Sort tiebreaker fixed (was always `0`). Knowledge cache sync now fires for all done-status variants (was only exact `"completed"`). Backfill script added. |
 | 3.2     | **Merged pipeline**: session_indexer + session_grader unified into `dream_pipeline.py`. **V2 grader rubric**: 5-dimension weighted scoring (systemic value 30%, deferred depth 25%, reasoning novelty 20%, actionability 15%, error quality 10%). Threshold: >= 0.70 worth dreaming, < 0.30 skip. Single `dream-pipeline` cron (every 2h) replaces two separate jobs. |
 | 3.1     | **Bug fixes**: completion detection (queue DB now synced when dreams finish normally), LLM timeout bug fixed (rule-based scheduler), 5 engine bugs in dream_loop_v3.py, ATTACH DATABASE fix. No DB schema changes. |

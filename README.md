@@ -39,8 +39,7 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
 | **Staleness Detection** | Dreams spinning without tree growth for 20+ minutes are cut off. |
 | **Wallclock Killer** | Scheduler kills any dream exceeding 30 minutes globally. |
 | **SQLite Performance Indexes** | Queue drains and session sorts are O(log n), not O(n). |
-| **Error → Dream Pipeline** | Tool crashes automatically trigger troubleshooting dreams. |
-| **Fast-Path分流** | Heuristic filter skips simple queries (greetings, confirmations, lookups) — no LLM cost. |
+| **BM25 Insight Injection** | Completed dreams scored by BM25 against each prompt — no topic filtering, no TTL, no expiry. Permanent memory. |
 | **Rich CLI Dashboard** | `dream-dashboard` shows live stats, insights, queue status, and grades. |
 
 ---
@@ -51,7 +50,7 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
                       ┌──────────────────────────────────────────────┐
                       │              dream_auto Plugin               │
                       │  (6 hooks: pre_llm, suggest, post_tool,      │
-                      │   post_llm, session_start, session_end)        │
+                      │   post_llm, session_start, session_end)      │
                      └──────────────────────┬───────────────────────┘
                                             │ queues dreams
                                             ▼
@@ -88,7 +87,7 @@ Think of it as giving your Hermes agent a second brain that thinks about your wo
 - **MCTS Engine v3** runs Monte Carlo Tree Search with UCB1-Tuned selection, parallel rollouts
 - **Tier 1** (always): fast LLM-only reasoning via `hermes chat -q`, ~1-2s
 - **Tier 2** (on-demand): tool-using AIAgent with `["terminal", "file", "session_search", "memory"]` toolsets — triggered when the best branch has Tier 1 confidence < 30%
-- **Insight Injection** silently prepends the best findings from completed dreams into your active context
+- **Insight Injection** (pre_llm_call): BM25-scores all completed dreams against the current user message and injects the top matches. Dreams are permanent — no TTL, no expiry. Uses `rank-bm25` when available; word-overlap fallback otherwise.
 
 ---
 
@@ -165,7 +164,7 @@ $HERMES_PY ~/.hermes/scripts/dream_scheduler.py --dry-run
 ### Manual Session Index
 
 ```bash
-$HERMES_PY ~/.hermes/scripts/session_indexer.py --limit 50
+$HERMES_PY ~/.hermes/scripts/dream_pipeline.py --index-only
 ```
 
 ---
@@ -181,7 +180,6 @@ Control the plugin with environment variables:
 | `DREAM_AUTO_MAX_INJECT` | `3` | Max dream insights injected per turn |
 | `DREAM_AUTO_THROTTLE_TURNS` | `5` | Fire `post_llm_call` hook at most every N turns |
 | `DREAM_AUTO_GLOBAL_THROTTLE` | `300` | Skip hook entirely every N seconds (global budget) |
-| `DREAM_AUTO_KNOWLEDGE_CACHE_TTL_DAYS` | `7` | TTL for knowledge cache entries |
 
 Add to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.):
 
@@ -196,10 +194,10 @@ export DREAM_AUTO_VERBOSE=1
 
 1. **You chat with Hermes normally.** The plugin listens via hooks.
 2. **Errors or complex questions** are detected and queued automatically.
-3. **Session indexer** (every 6h) scans recent sessions and grades them for dream potential.
+3. **Dream pipeline** (every 2h) scans recent sessions and grades them for dream potential.
 4. **Scheduler** (every 30min) checks CPU/RAM. If resources are free (CPU < 70%, RAM < 70%), it starts the highest-priority dream.
 5. **MCTS engine v3** runs background reasoning — Tier 1 (LLM-only) always runs; Tier 2 (tool-using AIAgent) fires when the best branch has confidence < 30%.
-6. **On your next message**, the plugin injects the best insights from completed dreams into your context silently.
+6. **On your next message**, the plugin BM25-scores all completed dreams against your prompt and injects the top matches silently.
 
 You don't interact with it. It just makes Hermes smarter over time.
 
@@ -209,10 +207,10 @@ You don't interact with it. It just makes Hermes smarter over time.
 
 | Platform | Status | Notes |
 |---|---|---|
-| **Linux** | ✅ Full | Tested on Fedora. Uses `hermes cron` → systemd user service. |
-| **macOS** | ✅ Full | Uses `hermes cron` → launchd. |
-| **Windows WSL** | ✅ Full | Run inside WSL. Install Hermes inside WSL, not Windows native. |
-| **Windows Native** | ❌ No | POSIX paths and subprocess behavior not supported. |
+| **Linux** | Full | Tested on Fedora. Uses `hermes cron` -> systemd user service. |
+| **macOS** | Full | Uses `hermes cron` -> launchd. |
+| **Windows WSL** | Full | Run inside WSL. Install Hermes inside WSL, not Windows native. |
+| **Windows Native** | No | POSIX paths and subprocess behavior not supported. |
 
 ---
 
@@ -222,11 +220,11 @@ You don't interact with it. It just makes Hermes smarter over time.
 |---|---|
 | `hermes: command not found` | Add Hermes to PATH before installing. |
 | `psutil` install fails | `sudo apt install python3-dev` (Linux) or `xcode-select --install` (macOS) |
-| Cron jobs not running | `hermes gateway status` → if down, `hermes gateway start` |
-| Dashboard shows empty | Run `session_indexer.py` manually once to populate DB |
+| Cron jobs not running | `hermes gateway status` -> if down, `hermes gateway start` |
+| Dashboard shows empty | Run `dream_pipeline.py --index-only` manually once to populate DB |
 | Dreams never start | Check resources: CPU must be < 70% and RAM < 70% for scheduler to start dreams |
 | Plugin not loading | Verify `DREAM_AUTO_ENABLED=1` and restart Hermes |
-| Session index empty after install | Run `$HERMES_PY ~/.hermes/scripts/session_indexer.py --limit 50` manually |
+| Session index empty after install | Run `$HERMES_PY ~/.hermes/scripts/dream_pipeline.py --index-only` manually |
 | Dreams stuck at low confidence | Normal — Tier 2 (tool-using) fires when Tier 1 confidence < 30% on the best branch |
 
 ---
@@ -251,13 +249,15 @@ dream-auto/
 ├── scripts/
 │   ├── dream_scheduler.py         # Queue manager + wallclock killer
 │   ├── dream_insights_dashboard.py # CLI dashboard
-│   ├── dream_pipeline.py            # Merged session indexer + grader (v2 rubric)
+│   ├── dream_pipeline.py          # Merged session indexer + grader
+│   ├── backfill_knowledge_cache.py # [DEPRECATED] no-op, kept for compatibility
 │   └── dream_loop_v3.py            # MCTS engine (also in skills/)
 └── skills/
     └── autonomous-ai-agents/
         └── hermes-dream-task/
             ├── SKILL.md
             └── scripts/
+                ├── dream_loop_v2.py  # legacy
                 ├── dream_loop_v3.py  # MCTS engine v3 — two-tier AIAgent
                 ├── fast_path.py       # Heuristic分流 (fast/slow path)
                 └── test_tool_rollouts.py
