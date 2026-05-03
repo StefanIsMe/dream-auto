@@ -1,8 +1,8 @@
-# Dream Auto v3.2 — Setup Guide
+# Dream Auto v3.3 — Setup Guide
 
 **For:** Hermes Agent (or any AI assistant with terminal/file access)
 **Repo:** https://github.com/StefanIsMe/dream-auto
-**Version:** 3.2
+**Version:** 3.3
 
 ---
 
@@ -444,6 +444,7 @@ dream-auto/
 
 | Version | What changed |
 |---------|-------------|
+| 3.3     | **Insight injection bugs fixed**: `_STATUS_DONE` missing `completed_success` (434 dreams), `failed`, etc. — most completed dreams were silently skipped during insight injection. Added all missing statuses. Sort tiebreaker fixed (was always `0`). Knowledge cache sync now fires for all done-status variants (was only exact `"completed"`). Backfill script added. |
 | 3.2     | **Merged pipeline**: session_indexer + session_grader unified into `dream_pipeline.py`. **V2 grader rubric**: 5-dimension weighted scoring (systemic value 30%, deferred depth 25%, reasoning novelty 20%, actionability 15%, error quality 10%). Threshold: >= 0.70 worth dreaming, < 0.30 skip. Single `dream-pipeline` cron (every 2h) replaces two separate jobs. |
 | 3.1     | **Bug fixes**: completion detection (queue DB now synced when dreams finish normally), LLM timeout bug fixed (rule-based scheduler), 5 engine bugs in dream_loop_v3.py, ATTACH DATABASE fix. No DB schema changes. |
 | 3.0.0   | Initial v3 release — MCTS engine, parallel rollouts, UCB1-Tuned, CI-width bonus, wallclock killer, SQLite indexes, knowledge cache |
