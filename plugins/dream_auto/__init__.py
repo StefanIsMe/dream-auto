@@ -101,9 +101,12 @@ def _knowledge_cache_ttl_days() -> int:
 
 # v3 meta.json uses non-standard status values. Normalize everything here.
 _STATUS_DONE = {
-    "done", "completed", "completed_killed", "failed_crash",
-    "killed_wallclock", "completed_stale", "stale_completed",
-    "completed_empty",
+    # Normal completion statuses
+    "done", "completed", "completed_success",
+    # Killed/stale variants
+    "completed_killed", "killed_wallclock", "completed_stale", "stale_completed", "completed_empty",
+    # Failure variants — these may have useful partial insights
+    "failed", "failed_crash", "failed_restart", "health_check_failed", "circuit_breaker",
 }
 
 
@@ -259,15 +262,17 @@ def _list_completed_dreams(topic_hints: list[str] = None) -> List[dict]:
 
         # v3 uses best_confidence, v2 uses confidence
         confidence = meta.get("best_confidence", meta.get("confidence", 0.0))
+        ended_at = meta.get("ended_at", meta.get("started_at", ""))
         dreams.append({
             "id": dream_path.name,
             "brief": meta.get("brief", "")[:200],
             "confidence": confidence,
             "topics": meta.get("topics", []),
+            "_ended_at": ended_at,
         })
 
     # Sort by confidence desc, newest first for equal confidence
-    dreams.sort(key=lambda d: (d["confidence"], 0), reverse=True)
+    dreams.sort(key=lambda d: (d["confidence"], d.get("_ended_at", "")), reverse=True)
     return dreams
 
 

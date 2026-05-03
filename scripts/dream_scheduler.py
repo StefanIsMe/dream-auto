@@ -307,8 +307,8 @@ def _sync_queue_status(dream_id: str, status: str):
         print(f"  [SYNC ERROR] {dream_id}: {e}")
 
     # When a dream completes, push its insights into the predictive knowledge cache
-    if status == "completed":
-        _sync_dream_to_knowledge_cache(dream_id)
+    # Fire for all done-status variants (completed_success, done, killed_wallclock, etc.)
+    _sync_dream_to_knowledge_cache(dream_id)
 
 
 def mark_started(dream_id: str):
