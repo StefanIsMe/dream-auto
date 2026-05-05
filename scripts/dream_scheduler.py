@@ -425,6 +425,7 @@ def start_dream_via_delegate(dream_id: str, brief: str, session_id: str):
     env = os.environ.copy()
     env.pop("HERMES_SESSION", None)
     env["DREAM_LOOP_ACTIVE"] = "1"
+    env["HERMES_SAVE_SESSION"] = "0"  # prevent session file pollution
 
     try:
         # Line-buffered stdout + unbuffered python so dream_output.log shows live progress

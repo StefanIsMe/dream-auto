@@ -142,6 +142,7 @@ def call_hermes(prompt: str, timeout: int = 90) -> str:
         env = os.environ.copy()
         env.pop("HERMES_SESSION", None)
         env["HERMES_QUIET"] = "1"
+        env["HERMES_SAVE_SESSION"] = "0"  # prevent session file pollution
         result = subprocess.run(
             [str(HERMES_BIN), "chat", "-q", prompt],
             capture_output=True,

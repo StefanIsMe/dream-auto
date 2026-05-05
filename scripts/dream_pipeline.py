@@ -365,6 +365,7 @@ def _call_hermes_chat(query: str, timeout: float = 90.0) -> str:
     env = os.environ.copy()
     env.pop("HERMES_SESSION", None)
     env["HERMES_QUIET"] = "1"
+    env["HERMES_SAVE_SESSION"] = "0"
     env["MEMORY_AUTO_ENABLED"] = "0"  # prevent 30-60s session search hang
 
     try:
