@@ -1,8 +1,8 @@
-# Dream Auto v3.4 — Setup Guide
+# Dream Auto v3.4.1 — Setup Guide
 
 **For:** Hermes Agent (or any AI assistant with terminal/file access)
 **Repo:** https://github.com/StefanIsMe/dream-auto
-**Version:** 3.4
+**Version:** 3.4.1
 
 ---
 
