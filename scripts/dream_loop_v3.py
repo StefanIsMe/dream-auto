@@ -52,6 +52,23 @@ SESSIONS_DIR = Path.home() / ".hermes" / "sessions"
 HERMES_BIN = Path.home() / ".local" / "bin" / "hermes"
 DREAM_SKILL_DIR = Path.home() / ".hermes" / "skills" / "autonomous-ai-agents" / "hermes-dream-task"
 
+# -- Dream Auto LLM overrides (source from ~/.hermes/config.yaml) -------------
+def _load_dream_cfg() -> dict[str, str]:
+    """Read dream_auto section from ~/.hermes/config.yaml."""
+    import yaml
+    config_path = Path.home() / ".hermes" / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        cfg = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return {}
+    return cfg.get("dream_auto", {}) or {}
+
+_DREAM_CFG = _load_dream_cfg()
+DREAM_PROVIDER = os.environ.get("DREAM_LLM_PROVIDER") or _DREAM_CFG.get("provider", "")
+DREAM_MODEL    = os.environ.get("DREAM_LLM_MODEL")    or _DREAM_CFG.get("model", "")
+
 GMT7 = timezone(timedelta(hours=7))
 
 # ── MCTS config ──────────────────────────────────────────────────────────────
@@ -143,8 +160,13 @@ def call_hermes(prompt: str, timeout: int = 90) -> str:
         env.pop("HERMES_SESSION", None)
         env["HERMES_QUIET"] = "1"
         env["HERMES_SAVE_SESSION"] = "0"  # prevent session file pollution
+        cmd = [str(HERMES_BIN), "chat", "-q", prompt]
+        if DREAM_PROVIDER:
+            cmd += ["--provider", DREAM_PROVIDER]
+        if DREAM_MODEL:
+            cmd += ["-m", DREAM_MODEL]
         result = subprocess.run(
-            [str(HERMES_BIN), "chat", "-q", prompt],
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -214,28 +236,21 @@ class DreamAgent:
             openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
             use_openrouter = bool(openrouter_key)
 
-            if use_openrouter:
-                # OpenRouter bypass — requires OPENROUTER_API_KEY env var
-                self._agent = AIAgent(
-                    provider="openrouter",
-                    model="anthropic/claude-sonnet-4",
-                    enabled_toolsets=self.toolsets,
-                    quiet_mode=True,
-                    verbose_logging=False,
-                    max_iterations=TOOL_CALL_LIMIT,
-                    tool_delay=TOOL_CALL_TIMEOUT,
-                )
-            else:
-                # Use user's configured provider (needs active gateway session for API key)
-                self._agent = AIAgent(
-                    provider=provider_cfg,
-                    model=model_cfg_default,
-                    enabled_toolsets=self.toolsets,
-                    quiet_mode=True,
-                    verbose_logging=False,
-                    max_iterations=TOOL_CALL_LIMIT,
-                    tool_delay=TOOL_CALL_TIMEOUT,
-                )
+            # -- Dream Auto LLM overrides --------------------------------------
+            # If DREAM_PROVIDER / DREAM_MODEL are set (via .env), they take
+            # precedence over the user's default config and even OpenRouter.
+            provider_cfg = DREAM_PROVIDER or (provider_cfg if not use_openrouter else "openrouter")
+            model_cfg_default = DREAM_MODEL or (model_cfg_default if not use_openrouter else "anthropic/claude-sonnet-4")
+
+            self._agent = AIAgent(
+                provider=provider_cfg,
+                model=model_cfg_default,
+                enabled_toolsets=self.toolsets,
+                quiet_mode=True,
+                verbose_logging=False,
+                max_iterations=TOOL_CALL_LIMIT,
+                tool_delay=TOOL_CALL_TIMEOUT,
+            )
         except Exception as e:
             self._init_error = str(e)
             self._agent = None
