@@ -257,7 +257,6 @@ dream-auto/
         └── hermes-dream-task/
             ├── SKILL.md
             └── scripts/
-                ├── dream_loop_v2.py  # legacy
                 ├── dream_loop_v3.py  # MCTS engine v3 — two-tier AIAgent
                 ├── fast_path.py       # Heuristic分流 (fast/slow path)
                 └── test_tool_rollouts.py
