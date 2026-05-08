@@ -188,6 +188,22 @@ export DREAM_AUTO_ENABLED=1
 export DREAM_AUTO_VERBOSE=1
 ```
 
+### Custom LLM provider / model for Dream Auto
+
+By default Dream Auto reuses your main Hermes model.  To route dreams to a
+different provider/model add a `dream_auto` block to `~/.hermes/config.yaml`:
+
+```yaml
+dream_auto:
+  provider: nous
+  model:    arcee-ai/trinity-large-thinking
+```
+
+- `provider` — any value accepted by `hermes chat --provider …`
+- `model`    — any value accepted by `hermes chat -m …`
+- Missing block / empty values → fall back to default
+  (config.yaml `model` section or OpenRouter, depending on keys).
+
 ---
 
 ## How It Works Day-to-Day

@@ -32,6 +32,23 @@ DREAM_DIR = Path.home() / ".hermes" / "state" / "dream"
 HERMES_BIN = Path.home() / ".local" / "bin" / "hermes"
 HERMES_AGENT_DIR = Path.home() / ".hermes" / "hermes-agent"
 
+# -- Dream Auto LLM overrides (source from ~/.hermes/config.yaml) -------------
+def _load_dream_cfg() -> dict[str, str]:
+    """Read dream_auto section from ~/.hermes/config.yaml."""
+    import yaml
+    config_path = Path.home() / ".hermes" / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        cfg = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return {}
+    return cfg.get("dream_auto", {}) or {}
+
+_DREAM_CFG = _load_dream_cfg()
+DREAM_PROVIDER = os.environ.get("DREAM_LLM_PROVIDER") or _DREAM_CFG.get("provider", "")
+DREAM_MODEL    = os.environ.get("DREAM_LLM_MODEL")    or _DREAM_CFG.get("model", "")
+
 GMT7 = timezone(timedelta(hours=7))
 
 # ── schema ───────────────────────────────────────────────────────────────────
@@ -369,8 +386,13 @@ def _call_hermes_chat(query: str, timeout: float = 90.0) -> str:
     env["MEMORY_AUTO_ENABLED"] = "0"  # prevent 30-60s session search hang
 
     try:
+        cmd = [str(HERMES_BIN), "chat", "-q", query, "--max-turns", "1"]
+        if DREAM_PROVIDER:
+            cmd += ["--provider", DREAM_PROVIDER]
+        if DREAM_MODEL:
+            cmd += ["-m", DREAM_MODEL]
         result = subprocess.run(
-            [str(HERMES_BIN), "chat", "-q", query, "--max-turns", "1"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
