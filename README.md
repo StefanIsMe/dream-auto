@@ -175,13 +175,13 @@ $HERMES_PY ~/.hermes/scripts/dream_pipeline.py --index-only
 
 Control the plugin with environment variables:
 
-|| Variable | Default | Description |
-||---|---|---|
-|| `DREAM_AUTO_ENABLED` | `1` | Set to `0` to disable entirely |
-|| `DREAM_AUTO_VERBOSE` | `0` | Set to `1` for detailed logging |
-|| `DREAM_AUTO_MAX_INJECT` | `3` | Max dream insights injected per turn |
-|| `DREAM_AUTO_THROTTLE_TURNS` | `5` | Fire `post_llm_call` hook at most every N turns |
-|| `DREAM_AUTO_GLOBAL_THROTTLE` | `300` | Skip hook entirely every N seconds (global budget) |
+| Variable | Default | Description |
+|---|---|---|
+| `DREAM_AUTO_ENABLED` | `1` | Set to `0` to disable entirely |
+| `DREAM_AUTO_VERBOSE` | `0` | Set to `1` for detailed logging |
+| `DREAM_AUTO_MAX_INJECT` | `3` | Max dream insights injected per turn |
+| `DREAM_AUTO_THROTTLE_TURNS` | `5` | Fire `post_llm_call` hook at most every N turns |
+| `DREAM_AUTO_GLOBAL_THROTTLE` | `300` | Skip hook entirely every N seconds (global budget) |
 
 Add to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.):
 
@@ -194,13 +194,13 @@ export DREAM_AUTO_VERBOSE=1
 
 Restrict when dreams are allowed to execute:
 
-|| Variable | Format | Example | Description |
-||---|---|---|---|
-|| `DREAM_AUTO_ALLOW_HOURS` | `HH:MM-HH:MM` | `22:00-06:00` | Dreams only in this window (24h format). NULL = always allowed |
-|| `DREAM_AUTO_DENY_HOURS` | `HH:MM-HH:MM` | `09:00-18:00` | Block dreams in this window. Takes precedence over ALLOW_HOURS |
-|| `DREAM_AUTO_TIMEZONE` | IANA TZ name | `America/New_York` | Timezone for window checks. Default: `UTC` |
-|| `DREAM_AUTO_MAX_DAILY_DREAMS` | Integer | `5` | Max dreams per calendar day (local TZ). `0` = unlimited |
-|| `DREAM_AUTO_FORCE_ALLOW_NEXT_RUN` | `0` or `1` | `1` | Override time/cap constraints once. Clears after use |
+| Variable | Format | Example | Description |
+|---|---|---|---|
+| `DREAM_AUTO_ALLOW_HOURS` | `HH:MM-HH:MM` | `22:00-06:00` | Dreams only in this window (24h format). NULL = always allowed |
+| `DREAM_AUTO_DENY_HOURS` | `HH:MM-HH:MM` | `09:00-18:00` | Block dreams in this window. Takes precedence over ALLOW_HOURS |
+| `DREAM_AUTO_TIMEZONE` | IANA TZ name | `America/New_York` | Timezone for window checks. Default: `UTC` |
+| `DREAM_AUTO_MAX_DAILY_DREAMS` | Integer | `5` | Max dreams per calendar day (local TZ). `0` = unlimited |
+| `DREAM_AUTO_FORCE_ALLOW_NEXT_RUN` | `0` or `1` | `1` | Override time/cap constraints once. Clears after use |
 
 **Examples:**
 
