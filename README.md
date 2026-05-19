@@ -171,6 +171,8 @@ $HERMES_PY ~/.hermes/scripts/dream_pipeline.py --index-only
 
 ## Configuration
 
+### Core Settings
+
 Control the plugin with environment variables:
 
 | Variable | Default | Description |
@@ -186,6 +188,48 @@ Add to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.):
 ```bash
 export DREAM_AUTO_ENABLED=1
 export DREAM_AUTO_VERBOSE=1
+```
+
+### Time & Resource Constraints
+
+Restrict when dreams are allowed to execute:
+
+| Variable | Format | Example | Description |
+|---|---|---|---|
+| `DREAM_AUTO_ALLOW_HOURS` | `HH:MM-HH:MM` | `22:00-06:00` | Dreams only in this window (24h format). NULL = always allowed |
+| `DREAM_AUTO_DENY_HOURS` | `HH:MM-HH:MM` | `09:00-18:00` | Block dreams in this window. Takes precedence over ALLOW_HOURS |
+| `DREAM_AUTO_TIMEZONE` | IANA TZ name | `America/New_York` | Timezone for window checks. Default: `UTC` |
+| `DREAM_AUTO_MAX_DAILY_DREAMS` | Integer | `5` | Max dreams per calendar day (local TZ). `0` = unlimited |
+| `DREAM_AUTO_FORCE_ALLOW_NEXT_RUN` | `0` or `1` | `1` | Override time/cap constraints once. Clears after use |
+
+**Examples:**
+
+```bash
+# Dreams only at night (10 PM to 6 AM local time)
+export DREAM_AUTO_ALLOW_HOURS="22:00-06:00"
+
+# Or block work hours instead
+export DREAM_AUTO_DENY_HOURS="09:00-18:00"
+
+# Set timezone explicitly
+export DREAM_AUTO_TIMEZONE="America/Los_Angeles"
+
+# Cap to 5 dreams per calendar day
+export DREAM_AUTO_MAX_DAILY_DREAMS=5
+```
+
+**Midnight-wrap windows:**
+
+- `22:00-06:00` = 10 PM to 6 AM (wraps midnight)
+- `09:00-18:00` = 9 AM to 6 PM (normal daytime)
+
+**Force override (one-time):**
+
+```bash
+# Allow the next scheduled dream to run regardless of time/cap
+export DREAM_AUTO_FORCE_ALLOW_NEXT_RUN=1
+hermes cron run dream-scheduler
+# Flag is cleared automatically after the check
 ```
 
 ---

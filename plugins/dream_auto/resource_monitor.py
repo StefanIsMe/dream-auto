@@ -14,6 +14,7 @@ Usage:
 import json
 import os
 import psutil
+import pytz
 import re
 import sqlite3
 import subprocess
@@ -41,6 +42,22 @@ class ResourceMonitor:
         self.cpu_clear_low = CPU_CLEAR_LOW
         self.ram_clear_high = RAM_CLEAR_HIGH
         self.ram_clear_low = RAM_CLEAR_LOW
+
+        # Time window constraints (env vars)
+        self.allow_hours = self._parse_time_window(
+            os.getenv("DREAM_AUTO_ALLOW_HOURS")
+        )
+        self.deny_hours = self._parse_time_window(
+            os.getenv("DREAM_AUTO_DENY_HOURS")
+        )
+        self.tz_name = os.getenv("DREAM_AUTO_TIMEZONE", "UTC")
+        try:
+            self.tz = pytz.timezone(self.tz_name)
+        except pytz.exceptions.UnknownTimeZoneError:
+            self.tz = pytz.UTC
+            self.tz_name = "UTC"
+        self.max_daily_dreams = int(os.getenv("DREAM_AUTO_MAX_DAILY_DREAMS", "0"))
+
 
     def get_state(self) -> dict:
         """Get full resource state."""
@@ -120,6 +137,122 @@ class ResourceMonitor:
                     pass
         return count
 
+    def _parse_time_window(self, window_str: Optional[str]) -> Optional[tuple[int, int]]:
+        """
+        Parse 'HH:MM-HH:MM' into (start_mins, end_mins).
+        Handles midnight wrap: '22:00-06:00' → (1320, 360) where 1320 > 360.
+        """
+        if not window_str:
+            return None
+        try:
+            match = re.match(r'^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$', window_str.strip())
+            if not match:
+                raise ValueError(f"Invalid time window format: {window_str}")
+            start_h, start_m, end_h, end_m = map(int, match.groups())
+            start_mins = start_h * 60 + start_m
+            end_mins = end_h * 60 + end_m
+            if not (0 <= start_h < 24 and 0 <= start_m < 60 and
+                    0 <= end_h < 24 and 0 <= end_m < 60):
+                raise ValueError(f"Time values out of range: {window_str}")
+            return (start_mins, end_mins)
+        except Exception as e:
+            print(f"WARNING: Failed to parse time window '{window_str}': {e}")
+            return None
+
+    def _is_in_time_window(self, window: tuple[int, int], now: datetime) -> bool:
+        """Check if now falls inside a time window (handles midnight wrap)."""
+        start_mins, end_mins = window
+        now_mins = now.hour * 60 + now.minute
+        if start_mins <= end_mins:
+            return start_mins <= now_mins < end_mins
+        else:
+            return now_mins >= start_mins or now_mins < end_mins
+
+    def _get_next_eligible_time(self, window: tuple[int, int], now: datetime) -> str:
+        """Calculate when the next eligible window opens."""
+        start_mins, end_mins = window
+        now_mins = now.hour * 60 + now.minute
+        if start_mins <= end_mins:
+            if now_mins < start_mins:
+                delta = start_mins - now_mins
+            else:
+                delta = (24 * 60) - now_mins + start_mins
+        else:
+            if now_mins >= start_mins:
+                delta = (24 * 60) - now_mins
+            elif now_mins < end_mins:
+                return "now (in allowed window)"
+            else:
+                delta = start_mins - now_mins
+        hours, mins = divmod(delta, 60)
+        next_time_mins = (now_mins + delta) % (24 * 60)
+        next_h, next_m = divmod(int(next_time_mins), 60)
+        return f"{next_h:02d}:{next_m:02d} (in {hours}h {mins}m)"
+
+    def _check_time_constraints(self) -> tuple[bool, str]:
+        """Check if current time is allowed for dream execution."""
+        force_allow_marker = DREAM_DIR / ".force_allow_next_run"
+        if force_allow_marker.exists():
+            try:
+                force_allow_marker.unlink()
+                return True, "Force-allow override (one-time, cleared)"
+            except Exception:
+                pass
+
+        try:
+            now = datetime.now(self.tz)
+        except Exception as e:
+            return False, f"Timezone error: {e}"
+
+        if self.deny_hours:
+            if self._is_in_time_window(self.deny_hours, now):
+                next_time = self._get_next_eligible_time(self.deny_hours, now)
+                start_h, start_m = divmod(self.deny_hours[0], 60)
+                end_h, end_m = divmod(self.deny_hours[1], 60)
+                return False, f"In deny window {start_h:02d}:{start_m:02d}–{end_h:02d}:{end_m:02d}. Next: {next_time}"
+
+        if self.allow_hours:
+            if not self._is_in_time_window(self.allow_hours, now):
+                next_time = self._get_next_eligible_time(self.allow_hours, now)
+                start_h, start_m = divmod(self.allow_hours[0], 60)
+                end_h, end_m = divmod(self.allow_hours[1], 60)
+                return False, f"Outside allow window {start_h:02d}:{start_m:02d}–{end_h:02d}:{end_m:02d}. Next: {next_time}"
+
+        return True, "Time constraints OK"
+
+    def _check_daily_dream_count(self) -> tuple[bool, str]:
+        """Check if we've hit the daily dream limit."""
+        if self.max_daily_dreams <= 0:
+            return True, "No daily cap set"
+
+        try:
+            if not DB_PATH.exists():
+                return True, "Dream queue DB not found (first run?)"
+
+            conn = sqlite3.connect(str(DB_PATH))
+            cursor = conn.cursor()
+
+            now = datetime.now(self.tz)
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM dream_queue
+                WHERE status IN ('completed_success', 'completed_partial', 'completed_error', 'done')
+                AND completed_at > ?
+            """, (today_start,))
+
+            count = cursor.fetchone()[0]
+            conn.close()
+
+            if count >= self.max_daily_dreams:
+                return False, f"Daily cap reached: {count}/{self.max_daily_dreams} dreams completed today"
+
+            remaining = self.max_daily_dreams - count
+            return True, f"Daily cap: {count}/{self.max_daily_dreams} ({remaining} remaining)"
+
+        except Exception as e:
+            return True, f"Could not check daily cap: {e}"
+
     def _llm_availability_decision(self, state: dict) -> tuple[bool, str]:
         """
         Use LLM to decide if resources are available when ambiguous.
@@ -160,12 +293,24 @@ class ResourceMonitor:
         Main entry point: should we start a new dream?
         Returns (available: bool, reason: str)
 
-        Decision tree:
-          - CPU >= 80% OR RAM >= 90%  → definitely NO
-          - CPU <= 30%                → definitely YES (RAM doesn't matter much)
-          - RAM in 50-90%, CPU 30-80% → ambiguous → LLM decides
-          - Otherwise                  → YES
+        Decision tree (in order):
+          1. Check time constraints (allow/deny hours)
+          2. Check daily dream limit
+          3. Check resource thresholds (CPU/RAM)
+
+        Returns first NO reason, or (True, OK) if all pass.
         """
+        # Time constraints first (fail fast, avoids wasting resources)
+        time_ok, time_reason = self._check_time_constraints()
+        if not time_ok:
+            return False, time_reason
+
+        # Daily cap check
+        cap_ok, cap_reason = self._check_daily_dream_count()
+        if not cap_ok:
+            return False, cap_reason
+
+        # Resource checks (existing logic)
         state = self.get_state()
         cpu = state["cpu_percent"]
         ram = state["ram_percent"]
