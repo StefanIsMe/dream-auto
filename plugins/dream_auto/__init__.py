@@ -656,6 +656,19 @@ def _on_pre_tool_call(
     return None
 
 
+# Known benign error patterns — errors from Hermes' own headless output channel
+# that are sanitized/stripped and contain no actionable context. Queuing these
+# wastes MCTS resources: all branches collapse to "direct analysis" at 0.50 cap.
+_BENIGN_ERROR_PATTERNS = [
+    "host=output",       # Hermes headless output channel sanitized errors
+]
+
+
+def _is_known_benign_error(result: str) -> bool:
+    """Check if an error output is a known benign artifact, not a real problem."""
+    return any(pattern in result for pattern in _BENIGN_ERROR_PATTERNS)
+
+
 def _on_post_tool_call(
     tool_name: str,
     args: dict,
@@ -667,11 +680,21 @@ def _on_post_tool_call(
     HOOK 3: Error-triggered dreams — add to queue immediately.
     NO entropy gate, NO complexity score. Just check: was there an error?
     If yes → queue a troubleshooting dream.
+    Skips known benign errors (e.g. host=output from Hermes headless output channel)
+    to avoid wasting MCTS resources on non-actionable error signals.
     """
     if not _enabled():
         return None
 
     if tool_name in ("execute_code", "terminal") and result and _is_error_output(result):
+        # ── Known benign error gate ───────────────────────────────────────────
+        # Skip errors that are artifacts of Hermes' own headless output channel.
+        # They contain no actionable context and collapse MCTS to "direct analysis".
+        if _is_known_benign_error(result):
+            if _verbose():
+                logger.debug(f"dream_auto v3: skipped benign error — host=output pattern")
+            return None
+
         brief = _auto_brief_from_error(tool_name, result[:500])
 
         # Add to scheduler queue
